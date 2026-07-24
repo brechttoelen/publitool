@@ -14679,7 +14679,7 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
           <div style={{ background: '#fff', borderRadius: 8, padding: 24, width: 520, maxWidth: '94vw', maxHeight: '92vh', overflowY: 'auto', boxShadow: '0 8px 40px rgba(0,0,0,0.25)' }}>
             <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 4 }}>Nieuw event</div>
             <div style={{ fontSize: 12, color: 'var(--grey)', marginBottom: 14 }}>
-              Kies een wedstrijd uit de kalender, of vul locatie en datum zelf in.
+              Kies een wedstrijd uit de kalender. Locatie, datum en koepel volgen daaruit.
             </div>
             <form onSubmit={createParcours}>
               <EditionPicker
@@ -14687,23 +14687,17 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
                 value={newEdition ? newEdition.edition_id : null}
                 onPick={(row) => {
                   setNewEdition(row);
-                  if (row) {
-                    // Locatie en datum overnemen uit de editie. De velden
-                    // blijven bewerkbaar — de kalender is een vertrekpunt,
-                    // geen keurslijf.
-                    setNewLocation(row.start_location || row.event_name || '');
-                    if (row.event_date) setNewDate(row.event_date);
-                  }
+                  if (!row) { setNewLocation(''); setNewDate(''); setNewKoepelId(''); return; }
+                  setNewLocation(row.start_location || row.event_name || '');
+                  if (row.event_date) setNewDate(row.event_date);
+                  // Koepel volgt uit de reeks van de wedstrijd: de koepel die
+                  // aan dezelfde series_slug gekoppeld is.
+                  const k = row.series_slug
+                    ? koepels.find(x => x.series_slug === row.series_slug)
+                    : null;
+                  setNewKoepelId(k ? k.id : '');
                 }}
               />
-              <div style={{ marginBottom: 11 }}>
-                <label style={{ display: 'block', fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: 'var(--grey)', marginBottom: 4 }}>Koepel (optioneel)</label>
-                <select value={newKoepelId} onChange={(e) => setNewKoepelId(e.target.value)}
-                  style={{ width: '100%', padding: '7px 9px', border: '1px solid var(--bdr)', borderRadius: 5, fontSize: 13, background: '#fff', fontFamily: 'inherit' }}>
-                  <option value="">— geen koepel —</option>
-                  {koepels.map(k => <option key={k.id} value={k.id}>{k.name}</option>)}
-                </select>
-              </div>
               {/* Locatie en datum komen uit de gekozen wedstrijd — niet los invulbaar. */}
               <div style={{ marginBottom: 16, padding: '10px 12px', background: '#fafafa', border: '1px solid #f0f0ee', borderRadius: 6 }}>
                 <div style={{ display: 'flex', gap: 20 }}>
@@ -14719,6 +14713,30 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
                       {newDate ? fmtDate(newDate) : '—'}
                     </div>
                   </div>
+                </div>
+                {/* Koepel is afgeleid uit de reeks van de gekozen wedstrijd. */}
+                <div style={{ marginTop: 10, paddingTop: 10, borderTop: '1px solid #ececea' }}>
+                  <div style={{ fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: 'var(--grey)', marginBottom: 3 }}>Koepel</div>
+                  {(() => {
+                    if (!newEdition) return <div style={{ fontSize: 13, color: 'var(--lgrey)' }}>—</div>;
+                    const k = koepels.find(x => x.id === newKoepelId);
+                    if (k) return (
+                      <div style={{ fontSize: 13, color: 'var(--blk2)', fontWeight: 600, display: 'flex', alignItems: 'center', gap: 7 }}>
+                        <span style={{ width: 10, height: 10, borderRadius: 3, background: k.color, display: 'inline-block', flexShrink: 0 }} />
+                        {k.name}
+                      </div>
+                    );
+                    if (!newEdition.series_slug) return (
+                      <div style={{ fontSize: 12, color: 'var(--grey)' }}>
+                        Geen koepel — deze wedstrijd zit niet in een reeks.
+                      </div>
+                    );
+                    return (
+                      <div style={{ fontSize: 12, color: 'var(--amber)' }}>
+                        Geen koepel gekoppeld aan reeks <strong>{newEdition.series_name}</strong>. Stel dat in onder Koepels.
+                      </div>
+                    );
+                  })()}
                 </div>
               </div>
               {RoleCan.manageUsers(user?.role) && restrictedUsers.length > 0 && (
@@ -15010,6 +15028,12 @@ function EditParcoursMetaModal({ parcours, seasons, koepels, restrictedUsers = [
                 if (row.event_date) setDate(row.event_date);
                 const match = seasons.find(x => x.label === row.season_label);
                 if (match) setSeasonId(match.id);
+                // Koepel volgt uit de reeks; is er geen koppeling, dan laten
+                // we de bestaande keuze staan in plaats van hem leeg te maken.
+                const k = row.series_slug
+                  ? koepels.find(x => x.series_slug === row.series_slug)
+                  : null;
+                if (k) setKoepelId(k.id);
               }
             }}
           />
@@ -15395,6 +15419,16 @@ function PartnerEditRow({ partner, busy, onUpdate, onDelete, isLast }) {
 // =================================================================
 function KoepelsTab({ koepels, partners, onReload }) {
   const [editingKoepel, setEditingKoepel] = useState(null); // koepel id whose partners are being edited
+  // Reeksen uit de wedstrijdendatabase — een koepel koppelt aan één reeks,
+  // zodat de koepel van een parcours afgeleid kan worden uit de wedstrijd.
+  const [seriesList, setSeriesList] = useState([]);
+  useEffect(() => {
+    let cancelled = false;
+    api.cal.series()
+      .then(r => { if (!cancelled) setSeriesList(r.series); })
+      .catch(() => { if (!cancelled) setSeriesList([]); });
+    return () => { cancelled = true; };
+  }, []);
   
   const addKoepel = async () => {
     const name = prompt('Naam van de nieuwe koepel:');
@@ -15441,6 +15475,7 @@ function KoepelsTab({ koepels, partners, onReload }) {
               key={k.id}
               koepel={k}
               koepelPartners={koepelPartners}
+              seriesList={seriesList}
               isEditing={editingKoepel === k.id}
               onToggleEdit={() => setEditingKoepel(editingKoepel === k.id ? null : k.id)}
               onUpdate={(updates) => updateKoepel(k.id, updates)}
@@ -15453,18 +15488,20 @@ function KoepelsTab({ koepels, partners, onReload }) {
   );
 }
 
-function KoepelCard({ koepel, koepelPartners, isEditing, onToggleEdit, onUpdate, onDelete }) {
+function KoepelCard({ koepel, koepelPartners, seriesList = [], isEditing, onToggleEdit, onUpdate, onDelete }) {
   const [name, setName] = useState(koepel.name);
   const [shortName, setShortName] = useState(koepel.short_name || '');
   const [color, setColor] = useState(koepel.color);
+  const [seriesSlug, setSeriesSlug] = useState(koepel.series_slug || '');
   const [selectedPartnerIds, setSelectedPartnerIds] = useState(new Set(koepel.partners.map(p => p.id)));
   
   useEffect(() => {
     setName(koepel.name);
     setShortName(koepel.short_name || '');
     setColor(koepel.color);
+    setSeriesSlug(koepel.series_slug || '');
     setSelectedPartnerIds(new Set(koepel.partners.map(p => p.id)));
-  }, [koepel.id, koepel.name, koepel.short_name, koepel.color, koepel.partners.map(p => p.id).join(',')]);
+  }, [koepel.id, koepel.name, koepel.short_name, koepel.color, koepel.series_slug, koepel.partners.map(p => p.id).join(',')]);
   
   const togglePartner = (pid) => {
     const next = new Set(selectedPartnerIds);
@@ -15474,6 +15511,11 @@ function KoepelCard({ koepel, koepelPartners, isEditing, onToggleEdit, onUpdate,
   
   const savePartners = () => {
     onUpdate({ partner_ids: Array.from(selectedPartnerIds) });
+  };
+  
+  const saveSeries = (slug) => {
+    setSeriesSlug(slug);
+    onUpdate({ series_slug: slug || null });
   };
   
   const saveBasics = () => {
@@ -15507,6 +15549,12 @@ function KoepelCard({ koepel, koepelPartners, isEditing, onToggleEdit, onUpdate,
           onBlur={saveBasics}
           style={{ width: 80, padding: '5px 8px', border: '1px solid var(--bdr)', borderRadius: 4, fontSize: 12, fontFamily: 'inherit', textAlign: 'center', color: 'var(--grey)' }}
         />
+        <select value={seriesSlug} onChange={(e) => saveSeries(e.target.value)}
+          title="Reeks in de wedstrijdendatabase waaruit deze koepel wordt afgeleid"
+          style={{ width: 190, padding: '5px 8px', border: '1px solid var(--bdr)', borderRadius: 4, fontSize: 11.5, fontFamily: 'inherit', background: seriesSlug ? '#fff' : '#fffbeb', color: seriesSlug ? 'var(--blk4)' : 'var(--amber)' }}>
+          <option value="">⚠ geen reeks gekoppeld</option>
+          {seriesList.map(sr => <option key={sr.slug} value={sr.slug}>{sr.name}</option>)}
+        </select>
         <div style={{ fontSize: 11, color: 'var(--grey)', marginRight: 12 }}>
           {koepel.partners.length} partner{koepel.partners.length !== 1 ? 's' : ''}
         </div>
