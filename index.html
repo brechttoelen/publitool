@@ -667,7 +667,7 @@ const api = {
   // ---------- parcours ----------
   parcoursList: async (filters = {}) => {
     let q = sb.from('publitool_parcours')
-      .select('id, season_id, koepel_id, location_name, race_date, bg_image_path, updated_at, season:publitool_seasons(label), koepel:publitool_koepels(name, color)');
+      .select('id, season_id, koepel_id, location_name, race_date, bg_image_path, updated_at, edition_id, edition_event_name, edition_event_date, season:publitool_seasons(label), koepel:publitool_koepels(name, color)');
     if (filters.season_id) q = q.eq('season_id', filters.season_id);
     if (filters.koepel_id) q = q.eq('koepel_id', filters.koepel_id);
     const rows = chk(await q);
@@ -713,6 +713,10 @@ const api = {
       koepel_id: fields.koepel_id || null,
       location_name: fields.location_name,
       race_date: fields.race_date,
+      // Zachte referentie naar de wedstrijdendatabase + snapshot voor weergave.
+      edition_id:         fields.edition_id || null,
+      edition_event_name: fields.edition_event_name || null,
+      edition_event_date: fields.edition_event_date || null,
     }).select().single());
     if (Array.isArray(allowed_user_ids) && allowed_user_ids.length) {
       await sb.from('publitool_parcours_users').insert(allowed_user_ids.map(uid => ({ parcours_id: row.id, user_id: uid })));
@@ -14282,6 +14286,8 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
   const [newLocation, setNewLocation] = useState('');
   const [newDate, setNewDate] = useState('');
   const [newAllowedUserIds, setNewAllowedUserIds] = useState([]);
+  // Gekozen editie uit de wedstrijdendatabase (volledige rij uit flcs_calendar_v1)
+  const [newEdition, setNewEdition] = useState(null);
   
   // Duplicate
   const [dupSource, setDupSource] = useState(null);
@@ -14359,11 +14365,22 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
     e.preventDefault();
     if (!currentSeasonId || !newLocation || !newDate) return;
     try {
+      // Het parcours hangt aan een Publitool-seizoen, de editie aan een
+      // kalender-seizoen. Die matchen we op label; lukt dat niet, dan houden
+      // we het seizoen dat in het dashboard geselecteerd staat.
+      let seasonIdForParcours = currentSeasonId;
+      if (newEdition && newEdition.season_label) {
+        const match = seasons.find(s => s.label === newEdition.season_label);
+        if (match) seasonIdForParcours = match.id;
+      }
       const res = await api.parcoursCreate({
-        season_id: currentSeasonId,
+        season_id: seasonIdForParcours,
         koepel_id: newKoepelId || null,
         location_name: newLocation.trim(),
         race_date: newDate,
+        edition_id:         newEdition ? newEdition.edition_id : null,
+        edition_event_name: newEdition ? newEdition.event_name : null,
+        edition_event_date: newEdition ? newEdition.event_date : null,
         // Alleen meesturen als admin én er is iets aangevinkt — backend negeert
         // het anders sowieso, maar dit houdt het verkeer schoon.
         ...(RoleCan.manageUsers(user?.role) && newAllowedUserIds.length > 0
@@ -14372,6 +14389,7 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
       });
       setShowNew(false);
       setNewLocation(''); setNewDate(''); setNewKoepelId(''); setNewAllowedUserIds([]);
+      setNewEdition(null);
       onOpenParcours(res.id);
     } catch (e) { alert('Kon parcours niet aanmaken: ' + e.message); }
   };
@@ -14656,12 +14674,25 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
       {/* New parcours modal */}
       {showNew && (
         <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 500 }}>
-          <div style={{ background: '#fff', borderRadius: 8, padding: 24, width: 480, maxWidth: '94vw', boxShadow: '0 8px 40px rgba(0,0,0,0.25)' }}>
+          <div style={{ background: '#fff', borderRadius: 8, padding: 24, width: 520, maxWidth: '94vw', maxHeight: '92vh', overflowY: 'auto', boxShadow: '0 8px 40px rgba(0,0,0,0.25)' }}>
             <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 4 }}>Nieuw event</div>
-            <div style={{ fontSize: 12, color: 'var(--grey)', marginBottom: 16 }}>
-              Voor seizoen <strong>{seasons.find(s => s.id === currentSeasonId)?.label || ''}</strong>
+            <div style={{ fontSize: 12, color: 'var(--grey)', marginBottom: 14 }}>
+              Kies een wedstrijd uit de kalender, of vul locatie en datum zelf in.
             </div>
             <form onSubmit={createParcours}>
+              <EditionPicker
+                value={newEdition ? newEdition.edition_id : null}
+                onPick={(row) => {
+                  setNewEdition(row);
+                  if (row) {
+                    // Locatie en datum overnemen uit de editie. De velden
+                    // blijven bewerkbaar — de kalender is een vertrekpunt,
+                    // geen keurslijf.
+                    setNewLocation(row.start_location || row.event_name || '');
+                    if (row.event_date) setNewDate(row.event_date);
+                  }
+                }}
+              />
               <div style={{ marginBottom: 11 }}>
                 <label style={{ display: 'block', fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: 'var(--grey)', marginBottom: 4 }}>Koepel (optioneel)</label>
                 <select value={newKoepelId} onChange={(e) => setNewKoepelId(e.target.value)}
@@ -14692,7 +14723,7 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
                 </div>
               )}
               <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-                <button type="button" onClick={() => { setShowNew(false); setNewAllowedUserIds([]); }}
+                <button type="button" onClick={() => { setShowNew(false); setNewAllowedUserIds([]); setNewEdition(null); }}
                   style={{ background: 'transparent', color: '#444', border: '1px solid var(--bdr)', padding: '8px 14px', borderRadius: 5, fontSize: 13, cursor: 'pointer' }}>
                   Annuleren
                 </button>
@@ -14734,11 +14765,171 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
   );
 }
 
+// =================================================================
+// EditionPicker — kies een wedstrijd uit de wedstrijdendatabase
+// -----------------------------------------------------------------
+// Getrapt: seizoen (default = huidig) -> discipline (default veldrijden)
+// -> editie. Bij een keuze geeft onPick de volledige rij uit
+// flcs_calendar_v1 terug, of null als de gebruiker terugvalt op
+// vrije invoer.
+//
+// Props:
+//   value    — edition_id van de huidige selectie (of null)
+//   onPick   — (editionRow | null) => void
+//   compact  — minder marge, voor gebruik in een bestaande modal
+// =================================================================
+function EditionPicker({ value, onPick, compact = false }) {
+  const [seasons, setSeasons] = useState([]);
+  const [disciplines, setDisciplines] = useState([]);
+  const [editions, setEditions] = useState([]);
+  const [seasonId, setSeasonId] = useState('');
+  const [discipline, setDiscipline] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [loadingEditions, setLoadingEditions] = useState(false);
+  const [err, setErr] = useState(null);
+
+  // Eerste load: seizoenen + disciplines, en meteen de kalender van het
+  // huidige seizoen. Faalt dit (tabellen nog niet aangemaakt), dan valt
+  // het formulier stilletjes terug op vrije invoer.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const [s, d] = await Promise.all([api.cal.seasons(), api.cal.disciplines()]);
+        if (cancelled) return;
+        setSeasons(s.seasons);
+        setDisciplines(d.disciplines);
+
+        const cur = s.seasons.find(x => x.is_current) || s.seasons[0];
+        const sid = cur ? cur.id : '';
+        setSeasonId(sid);
+
+        const hasCross = d.disciplines.some(x => x.slug === 'veldrijden');
+        setDiscipline(hasCross ? 'veldrijden' : (d.disciplines[0] ? d.disciplines[0].slug : ''));
+
+        if (sid) {
+          const c = await api.cal.calendar(sid);
+          if (!cancelled) setEditions(c.editions);
+        }
+      } catch (e) {
+        if (!cancelled) setErr(e.message);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const switchSeason = async (sid) => {
+    setSeasonId(sid);
+    onPick(null);            // selectie vervalt bij een ander seizoen
+    if (!sid) { setEditions([]); return; }
+    setLoadingEditions(true);
+    try {
+      const c = await api.cal.calendar(sid);
+      setEditions(c.editions);
+    } catch (e) { setErr(e.message); }
+    finally { setLoadingEditions(false); }
+  };
+
+  // Afgelaste edities laten we staan — je wil er soms tóch een parcours
+  // voor bewaren — maar we markeren ze duidelijk.
+  const visible = editions.filter(e => !discipline || e.discipline === discipline);
+  const selected = editions.find(e => e.edition_id === value) || null;
+
+  const lbl = {
+    display: 'block', fontSize: 9, fontWeight: 700, textTransform: 'uppercase',
+    letterSpacing: '.4px', color: 'var(--grey)', marginBottom: 4,
+  };
+  const sel = {
+    width: '100%', padding: '7px 9px', border: '1px solid var(--bdr)',
+    borderRadius: 5, fontSize: 13, background: '#fff', fontFamily: 'inherit',
+  };
+  const gap = compact ? 9 : 11;
+
+  if (loading) {
+    return <div style={{ marginBottom: gap }}><ToolenInlineLoader text="Wedstrijden laden..." padding={16} size="sm" /></div>;
+  }
+
+  if (err) {
+    return (
+      <div style={{ marginBottom: gap, fontSize: 11.5, color: 'var(--amber)', background: '#fef3c7', padding: '8px 10px', borderRadius: 5 }}>
+        Wedstrijdendatabase niet bereikbaar — vul locatie en datum hieronder handmatig in.
+      </div>
+    );
+  }
+
+  return (
+    <div style={{
+      marginBottom: gap, padding: compact ? 0 : 12,
+      background: compact ? 'transparent' : '#fafafa',
+      border: compact ? 'none' : '1px solid #f0f0ee', borderRadius: 6,
+    }}>
+      <div style={{ display: 'flex', gap: 8, marginBottom: gap }}>
+        <div style={{ flex: 1 }}>
+          <label style={lbl}>Seizoen</label>
+          <select value={seasonId} onChange={e => switchSeason(e.target.value)} style={sel}>
+            {seasons.length === 0 && <option value="">Geen seizoenen</option>}
+            {seasons.map(s => (
+              <option key={s.id} value={s.id}>{s.label}{s.is_current ? ' (huidig)' : ''}</option>
+            ))}
+          </select>
+        </div>
+        <div style={{ flex: 1 }}>
+          <label style={lbl}>Discipline</label>
+          <select value={discipline} onChange={e => { setDiscipline(e.target.value); onPick(null); }} style={sel}>
+            <option value="">Alle</option>
+            {disciplines.map(d => <option key={d.slug} value={d.slug}>{d.name}</option>)}
+          </select>
+        </div>
+      </div>
+
+      <div>
+        <label style={lbl}>Wedstrijd</label>
+        <select
+          value={value || ''}
+          disabled={loadingEditions}
+          onChange={e => {
+            const row = editions.find(x => x.edition_id === e.target.value) || null;
+            onPick(row);
+          }}
+          style={sel}>
+          <option value="">— geen wedstrijd, vrije invoer —</option>
+          {visible.map(e => (
+            <option key={e.edition_id} value={e.edition_id}>
+              {e.event_name}
+              {e.event_date ? ` — ${fmtDate(e.event_date)}` : ''}
+              {e.status === 'cancelled' ? ' (gaat niet door)' : ''}
+            </option>
+          ))}
+        </select>
+        {!loadingEditions && visible.length === 0 && (
+          <div style={{ fontSize: 10.5, color: 'var(--grey)', marginTop: 4 }}>
+            Geen wedstrijden in dit seizoen{discipline ? ' voor deze discipline' : ''}.
+          </div>
+        )}
+        {selected && (
+          <div style={{ fontSize: 10.5, color: 'var(--grey)', marginTop: 5, lineHeight: 1.5 }}>
+            {selected.series_name && <>{selected.series_name} · </>}
+            {selected.start_location || '?'} → {selected.finish_location || '?'}
+            {selected.stage_count > 0 && <> · {selected.stage_count} ritten</>}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function EditParcoursMetaModal({ parcours, seasons, koepels, restrictedUsers = [], canManageUsers = false, onClose, onDone }) {
   const [location, setLocation] = useState(parcours.location_name);
   const [date, setDate] = useState(parcours.race_date);
   const [seasonId, setSeasonId] = useState(parcours.season_id);
   const [koepelId, setKoepelId] = useState(parcours.koepel_id || '');
+  const [editionId, setEditionId] = useState(parcours.edition_id || null);
+  const [editionSnap, setEditionSnap] = useState({
+    name: parcours.edition_event_name || null,
+    date: parcours.edition_event_date || null,
+  });
   const [allowedUserIds, setAllowedUserIds] = useState([]);
   const [allowedUsersLoaded, setAllowedUsersLoaded] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -14772,6 +14963,9 @@ function EditParcoursMetaModal({ parcours, seasons, koepels, restrictedUsers = [
         race_date: date,
         season_id: seasonId,
         koepel_id: koepelId || null,
+        edition_id: editionId || null,
+        edition_event_name: editionId ? editionSnap.name : null,
+        edition_event_date: editionId ? editionSnap.date : null,
       };
       // Toegangs-toewijzingen alleen meesturen als admin én de lijst is geladen
       // (anders zouden we per ongeluk een lege lijst doorgeven en alle
@@ -14789,10 +14983,23 @@ function EditParcoursMetaModal({ parcours, seasons, koepels, restrictedUsers = [
   
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 500 }}>
-      <div style={{ background: '#fff', borderRadius: 8, padding: 24, width: 480, maxWidth: '94vw', boxShadow: '0 8px 40px rgba(0,0,0,0.25)' }}>
-        <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 16 }}>Parcours bewerken</div>
+      <div style={{ background: '#fff', borderRadius: 8, padding: 24, width: 520, maxWidth: '94vw', maxHeight: '92vh', overflowY: 'auto', boxShadow: '0 8px 40px rgba(0,0,0,0.25)' }}>
+        <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 14 }}>Parcours bewerken</div>
         {err && <div style={{ background: '#fef2f2', color: '#c0392b', padding: '8px 10px', borderRadius: 5, marginBottom: 12, fontSize: 12, borderLeft: '3px solid #c0392b' }}>{err}</div>}
         <form onSubmit={submit}>
+          <EditionPicker
+            value={editionId}
+            onPick={(row) => {
+              setEditionId(row ? row.edition_id : null);
+              setEditionSnap(row ? { name: row.event_name, date: row.event_date } : { name: null, date: null });
+              if (row) {
+                setLocation(row.start_location || row.event_name || '');
+                if (row.event_date) setDate(row.event_date);
+                const match = seasons.find(x => x.label === row.season_label);
+                if (match) setSeasonId(match.id);
+              }
+            }}
+          />
           <div style={{ marginBottom: 11 }}>
             <label style={{ display: 'block', fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: 'var(--grey)', marginBottom: 4 }}>Locatie</label>
             <input type="text" value={location} onChange={(e) => setLocation(e.target.value)} required autoFocus
