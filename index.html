@@ -449,53 +449,28 @@ const api = {
     return { ok: true };
   },
 
-  // ---------- koepels ----------
-  koepels: async () => {
-    const [koepels, links] = await Promise.all([
-      sb.from('publitool_koepels').select('*').order('sort_order').order('name'),
-      sb.from('publitool_koepel_partners').select('koepel_id, partner_id, sort_order, partner:publitool_partners(id, name, color, logo_path)').order('sort_order'),
-    ]);
-    const rows = chk(koepels);
-    const byKoepel = {};
-    for (const l of (chk(links) || [])) {
-      if (!byKoepel[l.koepel_id]) byKoepel[l.koepel_id] = [];
-      if (l.partner) byKoepel[l.koepel_id].push({ id: l.partner.id, name: l.partner.name, color: l.partner.color, logo_path: l.partner.logo_path });
-    }
-    return { koepels: rows.map(k => ({ ...k, partners: byKoepel[k.id] || [] })) };
-  },
-  createKoepel: async (data) => {
-    const { partner_ids, ...fields } = data;
-    const row = chk(await sb.from('publitool_koepels').insert(fields).select().single());
-    if (Array.isArray(partner_ids) && partner_ids.length) {
-      chk(await sb.from('publitool_koepel_partners').insert(partner_ids.map((pid, i) => ({ koepel_id: row.id, partner_id: pid, sort_order: i }))));
-    }
-    return { ok: true, id: row.id };
-  },
-  updateKoepel: async (data) => {
-    const { id, partner_ids, ...fields } = data;
-    if (Object.keys(fields).length) chk(await sb.from('publitool_koepels').update(fields).eq('id', id));
-    if (Array.isArray(partner_ids)) {
-      chk(await sb.from('publitool_koepel_partners').delete().eq('koepel_id', id));
-      if (partner_ids.length) {
-        chk(await sb.from('publitool_koepel_partners').insert(partner_ids.map((pid, i) => ({ koepel_id: id, partner_id: pid, sort_order: i }))));
-      }
-    }
-    return { ok: true };
-  },
-  deleteKoepel: async (id) => { chk(await sb.from('publitool_koepels').delete().eq('id', id)); return { ok: true }; },
-
   // ---------- partners ----------
   partners: async () => {
-    const [partners, links, eventLinks] = await Promise.all([
+    const [partners, links, eventLinks, seriesRows] = await Promise.all([
       sb.from('publitool_partners').select('*').order('name'),
-      sb.from('publitool_koepel_partners').select('partner_id, koepel:publitool_koepels(id, name, color)'),
+      sb.from('publitool_series_partners').select('partner_id, series_slug'),
       sb.from('publitool_parcours_partners').select('partner_id, parcours:publitool_parcours(id, location_name, race_date, season:publitool_seasons(label))'),
+      sb.from('flcs_series').select('slug, name, color').is('deleted_at', null),
     ]);
     const rows = chk(partners);
+    // Reeksen opzoeken op slug — geen foreign key, want flcs_series
+    // verhuist later naar een andere database.
+    const seriesBySlug = {};
+    for (const sr of (chk(seriesRows) || [])) seriesBySlug[sr.slug] = sr;
     const byPartner = {};
     for (const l of (chk(links) || [])) {
       if (!byPartner[l.partner_id]) byPartner[l.partner_id] = [];
-      if (l.koepel) byPartner[l.partner_id].push({ id: l.koepel.id, name: l.koepel.name, color: l.koepel.color });
+      const sr = seriesBySlug[l.series_slug];
+      byPartner[l.partner_id].push({
+        slug: l.series_slug,
+        name: sr ? sr.name : l.series_slug,
+        color: sr ? sr.color : '#888',
+      });
     }
     // Events (parcoursen) waar de partner expliciet aan gekoppeld is
     const eventsByPartner = {};
@@ -512,10 +487,24 @@ const api = {
     for (const k of Object.keys(eventsByPartner)) {
       eventsByPartner[k].sort((a, b) => b.race_date.localeCompare(a.race_date));
     }
-    return { partners: rows.map(p => ({ ...p, koepels: byPartner[p.id] || [], events: eventsByPartner[p.id] || [] })) };
+    return { partners: rows.map(p => ({ ...p, series: byPartner[p.id] || [], events: eventsByPartner[p.id] || [] })) };
   },
   createPartner: async (data) => {
-    const row = chk(await sb.from('publitool_partners').insert(data).select().single());
+    const { series_slugs, ...fields } = data;
+    const row = chk(await sb.from('publitool_partners').insert(fields).select().single());
+    if (Array.isArray(series_slugs) && series_slugs.length) {
+      // Koppelen aan de gekozen reeksen...
+      chk(await sb.from('publitool_series_partners').insert(
+        series_slugs.map((slug, i) => ({ series_slug: slug, partner_id: row.id, sort_order: i }))));
+      // ...en meteen toevoegen aan bestaande parcoursen van die reeksen,
+      // anders verschijnt de partner pas bij nieuwe parcoursen.
+      const existing = chk(await sb.from('publitool_parcours')
+        .select('id').in('series_slug', series_slugs));
+      if (existing && existing.length) {
+        chk(await sb.from('publitool_parcours_partners').insert(
+          existing.map(p => ({ parcours_id: p.id, partner_id: row.id }))));
+      }
+    }
     return { ok: true, id: row.id, partner: row };
   },
   updatePartner: async (data) => {
@@ -667,23 +656,21 @@ const api = {
   // ---------- parcours ----------
   parcoursList: async (filters = {}) => {
     let q = sb.from('publitool_parcours')
-      .select('id, season_id, koepel_id, location_name, race_date, bg_image_path, updated_at, season:publitool_seasons(label), koepel:publitool_koepels(name, color)');
+      .select('id, season_id, location_name, race_date, bg_image_path, updated_at, edition_id, edition_event_name, edition_event_date, series_slug, series_name, season:publitool_seasons(label)');
     if (filters.season_id) q = q.eq('season_id', filters.season_id);
-    if (filters.koepel_id) q = q.eq('koepel_id', filters.koepel_id);
+    if (filters.series_slug) q = q.eq('series_slug', filters.series_slug);
     const rows = chk(await q);
     const flat = rows.map(r => ({
       ...r,
       season_label: r.season ? r.season.label : null,
-      koepel_name:  r.koepel ? r.koepel.name  : null,
-      koepel_color: r.koepel ? r.koepel.color : null,
-      season: undefined, koepel: undefined,
+      season: undefined,
     }));
     return { parcours: sortParcoursRows(flat) };
   },
 
   parcoursGet: async (id) => {
     const row = chk(await sb.from('publitool_parcours')
-      .select('*, season:publitool_seasons(label), koepel:publitool_koepels(name)')
+      .select('*, season:publitool_seasons(label)')
       .eq('id', id).single());
     const links = chk(await sb.from('publitool_parcours_partners')
       .select('partner:publitool_partners(id, name, color, logo_path, is_local)')
@@ -698,8 +685,7 @@ const api = {
     return { parcours: {
       ...row,
       season_label: row.season ? row.season.label : null,
-      koepel_name:  row.koepel ? row.koepel.name : null,
-      season: undefined, koepel: undefined,
+      season: undefined,
       partners,
       allowed_user_ids,
     }};
@@ -710,12 +696,26 @@ const api = {
     delete fields.action;
     const row = chk(await sb.from('publitool_parcours').insert({
       season_id: fields.season_id,
-      koepel_id: fields.koepel_id || null,
       location_name: fields.location_name,
       race_date: fields.race_date,
+      // Zachte referentie naar de wedstrijdendatabase + snapshot voor weergave.
+      edition_id:         fields.edition_id || null,
+      edition_event_name: fields.edition_event_name || null,
+      edition_event_date: fields.edition_event_date || null,
+      series_slug:        fields.series_slug || null,
+      series_name:        fields.series_name || null,
     }).select().single());
     if (Array.isArray(allowed_user_ids) && allowed_user_ids.length) {
       await sb.from('publitool_parcours_users').insert(allowed_user_ids.map(uid => ({ parcours_id: row.id, user_id: uid })));
+    }
+    // Standaard-partners van de reeks meteen koppelen.
+    if (fields.series_slug) {
+      const sp = chk(await sb.from('publitool_series_partners')
+        .select('partner_id').eq('series_slug', fields.series_slug));
+      if (sp && sp.length) {
+        chk(await sb.from('publitool_parcours_partners').insert(
+          sp.map(x => ({ parcours_id: row.id, partner_id: x.partner_id }))));
+      }
     }
     return { ok: true, id: row.id };
   },
@@ -725,9 +725,14 @@ const api = {
     const src = chk(await sb.from('publitool_parcours').select('*').eq('id', srcId).single());
     const row = chk(await sb.from('publitool_parcours').insert({
       season_id: data.season_id || src.season_id,
-      koepel_id: (data.koepel_id !== undefined ? data.koepel_id : src.koepel_id) || null,
       location_name: data.location_name || src.location_name + ' (kopie)',
       race_date: data.race_date || src.race_date,
+      // Reeks en editie reizen mee met de kopie.
+      series_slug: data.series_slug !== undefined ? data.series_slug : src.series_slug,
+      series_name: data.series_name !== undefined ? data.series_name : src.series_name,
+      edition_id:         src.edition_id,
+      edition_event_name: src.edition_event_name,
+      edition_event_date: src.edition_event_date,
       bg_image_path: src.bg_image_path,
       bg_width: src.bg_width, bg_height: src.bg_height,
       bg_min_lat: src.bg_min_lat, bg_max_lat: src.bg_max_lat,
@@ -815,7 +820,247 @@ const api = {
     const { data } = sb.storage.from(kind).getPublicUrl(filename);
     return { url: data.publicUrl, filename, size: file.size, mime: file.type };
   },
+
+  // ---------- wedstrijdendatabase (flcs_*) ----------
+  // Aparte namespace omdat deze tabellen later naar de FLCS-toolkit-DB
+  // verhuizen. Alles wat hieronder staat praat enkel met flcs_*-tabellen,
+  // nooit met publitool_*. Bij de verhuizing wissel je hier de client om
+  // (een tweede createClient naar het andere project) en verder niets.
+  cal: {
+    // ----- disciplines -----
+    disciplines: async () => {
+      const rows = chk(await sb.from('flcs_disciplines')
+        .select('*').is('deleted_at', null)
+        .order('sort_order').order('name'));
+      return { disciplines: rows || [] };
+    },
+    createDiscipline: async (data) => {
+      const row = chk(await sb.from('flcs_disciplines').insert({
+        slug: data.slug, name: data.name, sort_order: data.sort_order ?? 0,
+      }).select().single());
+      return { discipline: row };
+    },
+    updateDiscipline: async (id, fields) => {
+      chk(await sb.from('flcs_disciplines').update(fields).eq('id', id));
+      return { ok: true };
+    },
+    deleteDiscipline: async (id) => {
+      chk(await sb.from('flcs_disciplines')
+        .update({ deleted_at: new Date().toISOString() }).eq('id', id));
+      return { ok: true };
+    },
+
+    // ----- seizoenen -----
+    seasons: async () => {
+      const rows = chk(await sb.from('flcs_seasons')
+        .select('*').is('deleted_at', null)
+        .order('start_year', { ascending: false }));
+      return { seasons: rows || [] };
+    },
+    createSeason: async ({ label, start_year, end_year }) => {
+      const row = chk(await sb.from('flcs_seasons')
+        .insert({ label, start_year, end_year }).select().single());
+      return { season: row };
+    },
+    updateSeason: async (id, fields) => {
+      chk(await sb.from('flcs_seasons').update(fields).eq('id', id));
+      return { ok: true };
+    },
+    setCurrentSeason: async (id) => {
+      // Unieke index laat maar één is_current toe: eerst allemaal uit.
+      chk(await sb.from('flcs_seasons').update({ is_current: false })
+        .is('deleted_at', null).eq('is_current', true));
+      chk(await sb.from('flcs_seasons').update({ is_current: true }).eq('id', id));
+      return { ok: true };
+    },
+    deleteSeason: async (id) => {
+      // Soft delete: verwijzingen vanuit andere apps mogen nooit betekenisloos worden.
+      chk(await sb.from('flcs_seasons')
+        .update({ deleted_at: new Date().toISOString(), is_current: false }).eq('id', id));
+      return { ok: true };
+    },
+
+    // ----- reeksen -----
+    series: async () => {
+      const rows = chk(await sb.from('flcs_series')
+        .select('*').is('deleted_at', null)
+        .order('sort_order').order('name'));
+      return { series: rows || [] };
+    },
+    createSeries: async (data) => {
+      const row = chk(await sb.from('flcs_series').insert({
+        slug: data.slug, name: data.name,
+        discipline: data.discipline || 'veldrijden',
+        sort_order: data.sort_order ?? 0,
+        short_name: data.short_name || null,
+        color: data.color || '#1c1917',
+      }).select().single());
+      return { series: row };
+    },
+    updateSeries: async (id, fields) => {
+      chk(await sb.from('flcs_series').update(fields).eq('id', id));
+      return { ok: true };
+    },
+    deleteSeries: async (id) => {
+      chk(await sb.from('flcs_series')
+        .update({ deleted_at: new Date().toISOString() }).eq('id', id));
+      return { ok: true };
+    },
+
+    // ----- wedstrijden (tijdloze identiteit) -----
+    events: async () => {
+      const rows = chk(await sb.from('flcs_events')
+        .select('*').is('deleted_at', null)
+        .order('name'));
+      return { events: rows || [] };
+    },
+    createEvent: async (data) => {
+      const row = chk(await sb.from('flcs_events').insert({
+        slug: data.slug, name: data.name,
+        discipline: data.discipline,
+        is_active: data.is_active !== false,
+        notes: data.notes || null,
+      }).select().single());
+      return { event: row };
+    },
+    updateEvent: async (id, fields) => {
+      chk(await sb.from('flcs_events').update(fields).eq('id', id));
+      return { ok: true };
+    },
+    deleteEvent: async (id) => {
+      chk(await sb.from('flcs_events')
+        .update({ deleted_at: new Date().toISOString() }).eq('id', id));
+      return { ok: true };
+    },
+
+    // ----- partners per reeks (lokaal, blijft in de Publitool-database) -----
+    seriesPartners: async () => {
+      const rows = chk(await sb.from('publitool_series_partners')
+        .select('series_slug, partner_id, sort_order, partner:publitool_partners(id, name, color, logo_path, is_local)')
+        .order('sort_order'));
+      const bySeries = {};
+      for (const l of (rows || [])) {
+        if (!bySeries[l.series_slug]) bySeries[l.series_slug] = [];
+        if (l.partner) bySeries[l.series_slug].push(l.partner);
+      }
+      return { bySeries };
+    },
+    setSeriesPartners: async (slug, partnerIds) => {
+      chk(await sb.from('publitool_series_partners').delete().eq('series_slug', slug));
+      if (Array.isArray(partnerIds) && partnerIds.length) {
+        chk(await sb.from('publitool_series_partners')
+          .insert(partnerIds.map((pid, i) => ({ series_slug: slug, partner_id: pid, sort_order: i }))));
+      }
+      return { ok: true };
+    },
+
+    // ----- kalender (lezen via de view = hetzelfde contract als andere apps) -----
+    calendar: async (seasonId = null) => {
+      let q = sb.from('flcs_calendar_v1').select('*');
+      if (seasonId) q = q.eq('season_id', seasonId);
+      const rows = chk(await q.order('event_date', { ascending: true, nullsFirst: false })
+        .order('event_name'));
+      return { editions: rows || [] };
+    },
+
+    // ----- edities (schrijven op de tabel) -----
+    createEdition: async (data) => {
+      const row = chk(await sb.from('flcs_event_editions').insert({
+        event_id: data.event_id,
+        season_id: data.season_id,
+        series_id: data.series_id || null,
+        status: data.status || 'planned',
+        event_date: data.event_date || null,
+        start_time: data.start_time || null,
+        start_location: data.start_location || null,
+        finish_location: data.finish_location || null,
+        notes: data.notes || null,
+      }).select().single());
+      return { edition: row };
+    },
+    updateEdition: async (id, fields) => {
+      chk(await sb.from('flcs_event_editions').update(fields).eq('id', id));
+      return { ok: true };
+    },
+    deleteEdition: async (id) => {
+      chk(await sb.from('flcs_event_editions')
+        .update({ deleted_at: new Date().toISOString() }).eq('id', id));
+      return { ok: true };
+    },
+
+    // ----- ritten (meerdaagse wedstrijden) -----
+    stages: async (editionId) => {
+      const rows = chk(await sb.from('flcs_stages')
+        .select('*').eq('edition_id', editionId).is('deleted_at', null)
+        .order('stage_number'));
+      return { stages: rows || [] };
+    },
+    createStage: async (data) => {
+      const row = chk(await sb.from('flcs_stages').insert({
+        edition_id: data.edition_id,
+        stage_number: data.stage_number,
+        name: data.name || null,
+        stage_date: data.stage_date || null,
+        start_time: data.start_time || null,
+        start_location: data.start_location || null,
+        finish_location: data.finish_location || null,
+      }).select().single());
+      return { stage: row };
+    },
+    updateStage: async (id, fields) => {
+      chk(await sb.from('flcs_stages').update(fields).eq('id', id));
+      return { ok: true };
+    },
+    deleteStage: async (id) => {
+      chk(await sb.from('flcs_stages')
+        .update({ deleted_at: new Date().toISOString() }).eq('id', id));
+      return { ok: true };
+    },
+  },
 };
+
+// =================================================================
+// Kalender-helpers
+// =================================================================
+// Fallback zolang de disciplines uit de database nog niet geladen zijn.
+// De echte lijst komt uit flcs_disciplines (zie api.cal.disciplines).
+const DISCIPLINES_FALLBACK = [
+  { slug: 'veldrijden', name: 'Veldrijden' },
+  { slug: 'weg',        name: 'Weg' },
+  { slug: 'mtb',        name: 'MTB' },
+  { slug: 'gravel',     name: 'Gravel' },
+  { slug: 'piste',      name: 'Piste' },
+  { slug: 'andere',     name: 'Andere' },
+];
+
+const EDITION_STATUS = [
+  { value: 'planned',   label: 'Gepland',      color: '#a16207', bg: '#fef3c7' },
+  { value: 'confirmed', label: 'Bevestigd',    color: '#15803d', bg: '#dcfce7' },
+  { value: 'cancelled', label: 'Gaat niet door', color: '#b91c1c', bg: '#fee2e2' },
+];
+
+// Slug -> leesbare naam. Onbekende slugs tonen we gewoon zoals ze zijn,
+// zodat een verwijderde discipline geen lege cel oplevert.
+function disciplineLabel(slug, list) {
+  if (!slug) return '—';
+  const src = (list && list.length) ? list : DISCIPLINES_FALLBACK;
+  const d = src.find(x => x.slug === slug);
+  return d ? d.name : slug;
+}
+
+function statusMeta(v) {
+  return EDITION_STATUS.find(x => x.value === v) || EDITION_STATUS[0];
+}
+
+// Slug uit een naam: 'Ronde van Vlaanderen' -> 'ronde-van-vlaanderen'
+function slugify(text) {
+  return (text || '')
+    .toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')  // accenten weg
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60);
+}
 // =================================================================
 // ToolenInlineLoader — kleine inline loader met breathing toolen-icoon
 // -----------------------------------------------------------------
@@ -2305,7 +2550,7 @@ function ScaleSetOverlay({ mode, metersPerPixel, metersPerPixelOverride, onCance
 
 function ParcoursEditor({ parcoursId, onBackToDashboard, user, shareMode = false, shareData = null }) {
   // Parcours metadata from DB
-  const [parcoursMeta, setParcoursMeta] = useState(null); // { id, season_id, koepel_id, location_name, race_date, season_label, koepel_name, ... }
+  const [parcoursMeta, setParcoursMeta] = useState(null); // { id, season_id, location_name, race_date, season_label, series_name, ... }
   const [loadingParcours, setLoadingParcours] = useState(true);
   const [loadError, setLoadError] = useState(null);
   
@@ -2508,7 +2753,7 @@ function ParcoursEditor({ parcoursId, onBackToDashboard, user, shareMode = false
         location_name: p.location_name,
         race_date: p.race_date,
         season_label: p.season_label,
-        koepel_name: p.koepel_name,
+        series_name: p.series_name,
       });
       setPartners(sharedPartners.map(pp => ({
         id: 'p-db-' + pp.id,
@@ -6402,7 +6647,7 @@ function ParcoursEditor({ parcoursId, onBackToDashboard, user, shareMode = false
   };
   
   // Draws the footer band on the current jsPDF page.
-  // Layout: [FLCS V-monogram at far left] [parcours / koepel at center] [date / export-stamp at far right]
+  // Layout: [FLCS V-monogram at far left] [parcours / reeks at center] [date / export-stamp at far right]
   // Total height ~18mm. Async because the SVG monogram is rasterised on first use.
   const drawFooterBand = async (doc, pageW, pageH, footerH, profileName = null) => {
     // ============================================================
@@ -6473,7 +6718,7 @@ function ParcoursEditor({ parcoursId, onBackToDashboard, user, shareMode = false
     // ===== 2. Midden: titel + meta-regel =====
     const padMid = 10;
     const wedstrijd = parcoursMeta?.location_name || '';
-    const koepel = parcoursMeta?.koepel_name || '';
+    const reeks = parcoursMeta?.series_name || '';
     
     const raceDate = parcoursMeta?.race_date || '';
     let raceDateShort = '';
@@ -6499,9 +6744,9 @@ function ParcoursEditor({ parcoursId, onBackToDashboard, user, shareMode = false
     doc.setFontSize(13);
     doc.text(titleParts.join('  ·  ') || '—', midX0 + padMid, titleY);
     
-    // Meta: koepel · parcours-lengte
+    // Meta: reeks · parcours-lengte
     const subParts = [];
-    if (koepel) subParts.push(koepel);
+    if (reeks) subParts.push(reeks);
     if (metersPerPixel != null && parcoursPoints.length >= 2) {
       subParts.push(formatMeters(totalParcoursLength()));
     }
@@ -7546,7 +7791,7 @@ function ParcoursEditor({ parcoursId, onBackToDashboard, user, shareMode = false
             <PublitoolIcon size={22} style={{ marginRight: 2 }} />
             <div style={{ fontSize: 13, fontWeight: 600 }}>{parcoursMeta?.location_name}</div>
             <div style={{ fontSize: 11, color: 'var(--grey)' }}>
-              {parcoursMeta?.season_label} {parcoursMeta?.koepel_name ? `· ${parcoursMeta.koepel_name}` : ''}
+              {parcoursMeta?.season_label} {parcoursMeta?.series_name ? `· ${parcoursMeta.series_name}` : ''}
             </div>
           </div>
         </div>
@@ -7679,7 +7924,7 @@ function ParcoursEditor({ parcoursId, onBackToDashboard, user, shareMode = false
             <PublitoolIcon size={22} style={{ marginRight: 2 }} />
             <div style={{ fontSize: 13, fontWeight: 600, letterSpacing: '-0.3px' }}>{parcoursMeta?.location_name || 'Parcours'}</div>
             <div style={{ fontSize: 11, color: 'var(--grey)' }}>
-              {parcoursMeta?.season_label}{parcoursMeta?.koepel_name ? ` · ${parcoursMeta.koepel_name}` : ''}
+              {parcoursMeta?.season_label}{parcoursMeta?.series_name ? ` · ${parcoursMeta.series_name}` : ''}
             </div>
           </div>
           {shareMode ? (
@@ -14037,7 +14282,7 @@ function AllowedUsersPicker({ label, helpText, users, selectedIds, onChange, dis
 // =================================================================
 function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) {
   // Top-level tab: gestuurd vanuit App via URL-routing.
-  //  - currentTab: 'parcours' | 'partners' | 'koepels' | 'profiles' | 'users'
+  //  - currentTab: 'parcours' | 'wedstrijden' | 'partners' | 'profiles' | 'users'
   //  - onTabChange(tabId): update URL + parent state
   // Lokale fallback voor het geval de prop ontbreekt (defensive — niet meer gebruikt).
   const [tabFallback, setTabFallback] = useState('parcours');
@@ -14045,13 +14290,13 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
   const setTab = onTabChange || setTabFallback;
   
   const [seasons, setSeasons] = useState([]);
-  const [koepels, setKoepels] = useState([]);
+  const [seriesList, setSeriesList] = useState([]);
   const [partners, setPartners] = useState([]);
   const [parcoursList, setParcoursList] = useState([]);
   const [currentSeasonId, setCurrentSeasonId] = useState(null);
-  // Koepel-filter voor de events-grid: '' = alle, 'none' = parcoursen zonder
-  // koepel, anders een numerieke koepel-id (als string in de <select>).
-  const [koepelFilter, setKoepelFilter] = useState('');
+  // Reeks-filter voor de events-grid: '' = alle, 'none' = parcoursen zonder
+  // reeks, anders een series_slug.
+  const [seriesFilter, setSeriesFilter] = useState('');
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState(null);
   
@@ -14061,21 +14306,22 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
   
   // New parcours form
   const [showNew, setShowNew] = useState(false);
-  const [newKoepelId, setNewKoepelId] = useState('');
   const [newLocation, setNewLocation] = useState('');
   const [newDate, setNewDate] = useState('');
   const [newAllowedUserIds, setNewAllowedUserIds] = useState([]);
+  // Gekozen editie uit de wedstrijdendatabase (volledige rij uit flcs_calendar_v1)
+  const [newEdition, setNewEdition] = useState(null);
   
   // Duplicate
   const [dupSource, setDupSource] = useState(null);
-  const [editMeta, setEditMeta] = useState(null); // parcours object whose meta (name/date/koepel/season) is being edited
+  const [editMeta, setEditMeta] = useState(null); // parcours object whose meta (wedstrijd/datum/reeks/seizoen) is being edited
   
   const reloadAll = async (selectedSeasonId = null) => {
     setLoading(true);
     try {
-      const [s, k, p] = await Promise.all([api.seasons(), api.koepels(), api.partners()]);
+      const [s, k, p] = await Promise.all([api.seasons(), api.cal.series(), api.partners()]);
       setSeasons(s.seasons);
-      setKoepels(k.koepels);
+      setSeriesList(k.series);
       setPartners(p.partners);
       
       // Voor admins: lijst van gebruikers zonder full access ophalen — die kunnen
@@ -14131,7 +14377,7 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
   
   const onSeasonChange = async (sid) => {
     setCurrentSeasonId(sid);
-    setKoepelFilter(''); // andere seizoen = mogelijk andere koepels; reset
+    setSeriesFilter(''); // ander seizoen = mogelijk andere reeksen; reset
     try {
       const p = await api.parcoursList({ season_id: sid });
       setParcoursList(p.parcours);
@@ -14140,13 +14386,27 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
   
   const createParcours = async (e) => {
     e.preventDefault();
+    // Een event komt altijd uit de wedstrijdendatabase — geen vrije invoer.
+    if (!newEdition) return;
     if (!currentSeasonId || !newLocation || !newDate) return;
     try {
+      // Het parcours hangt aan een Publitool-seizoen, de editie aan een
+      // kalender-seizoen. Die matchen we op label; lukt dat niet, dan houden
+      // we het seizoen dat in het dashboard geselecteerd staat.
+      let seasonIdForParcours = currentSeasonId;
+      if (newEdition && newEdition.season_label) {
+        const match = seasons.find(s => s.label === newEdition.season_label);
+        if (match) seasonIdForParcours = match.id;
+      }
       const res = await api.parcoursCreate({
-        season_id: currentSeasonId,
-        koepel_id: newKoepelId || null,
+        season_id: seasonIdForParcours,
+        series_slug: newEdition ? (newEdition.series_slug || null) : null,
+        series_name: newEdition ? (newEdition.series_name || null) : null,
         location_name: newLocation.trim(),
         race_date: newDate,
+        edition_id:         newEdition ? newEdition.edition_id : null,
+        edition_event_name: newEdition ? newEdition.event_name : null,
+        edition_event_date: newEdition ? newEdition.event_date : null,
         // Alleen meesturen als admin én er is iets aangevinkt — backend negeert
         // het anders sowieso, maar dit houdt het verkeer schoon.
         ...(RoleCan.manageUsers(user?.role) && newAllowedUserIds.length > 0
@@ -14154,7 +14414,8 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
           : {}),
       });
       setShowNew(false);
-      setNewLocation(''); setNewDate(''); setNewKoepelId(''); setNewAllowedUserIds([]);
+      setNewLocation(''); setNewDate(''); setNewAllowedUserIds([]);
+      setNewEdition(null);
       onOpenParcours(res.id);
     } catch (e) { alert('Kon parcours niet aanmaken: ' + e.message); }
   };
@@ -14188,8 +14449,8 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
         const role = user?.role || 'gebruiker';
         const navItems = [
           { id: 'parcours', label: 'Events',           icon: '📅', show: true },
+          { id: 'wedstrijden', label: 'Wedstrijden',   icon: '🏁', show: true },
           { id: 'partners', label: 'Partners',         icon: '🤝', show: RoleCan.managePartners(user?.role) },
-          { id: 'koepels',  label: 'Koepels',          icon: '🏆', show: RoleCan.manageKoepels(user?.role) },
           { id: 'profiles', label: 'Export-profielen', icon: '📄', show: RoleCan.manageProfiles(user?.role) },
           { id: 'users',    label: 'Gebruikers',       icon: '👤', show: RoleCan.manageUsers(user?.role) },
         ].filter(t => t.show);
@@ -14198,8 +14459,8 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
           const col = active ? PT_PRIMARY : '#8a8a86';
           const icons = {
             parcours: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={col} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><rect x="4" y="5" width="16" height="16" rx="2"/><path d="M16 3v4M8 3v4M4 11h16"/></svg>,
+            wedstrijden: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={col} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M4 21V4"/><path d="M4 4h11l-1.5 3.5L15 11H4"/><path d="M4 15h12"/></svg>,
             partners: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={col} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>,
-            koepels:  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={col} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>,
             profiles: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={col} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>,
             users:    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={col} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>,
           };
@@ -14283,7 +14544,7 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
         {/* Smalle topbar per sectie */}
         <div style={{ background: '#fff', borderBottom: '1px solid #e8e8e6', padding: '0 20px', height: 52, display: 'flex', alignItems: 'center', gap: 10, position: 'sticky', top: 0, zIndex: 50, flexShrink: 0 }}>
           <div style={{ fontSize: 15, fontWeight: 600, color: '#1d1d1b', flex: 1 }}>
-            {{ parcours: 'Events', partners: 'Partners', koepels: 'Koepels', profiles: 'Export-profielen', users: 'Gebruikers' }[tab]}
+            {{ parcours: 'Events', wedstrijden: 'Wedstrijden', partners: 'Partners', profiles: 'Export-profielen', users: 'Gebruikers' }[tab]}
           </div>
           {tab === 'parcours' && (
             <>
@@ -14294,19 +14555,19 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
                 ))}
               </select>
               {(() => {
-                const idsInSeason = new Set(parcoursList.map(p => p.koepel_id).filter(id => id != null).map(String));
-                const koepelsInSeason = koepels.filter(k => idsInSeason.has(String(k.id)));
-                const hasUnassigned = parcoursList.some(p => p.koepel_id == null);
-                if ((koepelsInSeason.length + (hasUnassigned ? 1 : 0)) <= 1) return null;
+                const slugsInSeason = new Set(parcoursList.map(p => p.series_slug).filter(Boolean));
+                const seriesInSeason = seriesList.filter(k => slugsInSeason.has(k.slug));
+                const hasUnassigned = parcoursList.some(p => !p.series_slug);
+                if ((seriesInSeason.length + (hasUnassigned ? 1 : 0)) <= 1) return null;
                 return (
-                  <select value={koepelFilter} onChange={(e) => setKoepelFilter(e.target.value)}
+                  <select value={seriesFilter} onChange={(e) => setSeriesFilter(e.target.value)}
                     style={{ padding: '5px 9px', border: '1px solid #ddd', borderRadius: 5, fontSize: 12, fontFamily: 'inherit', background: '#fff', cursor: 'pointer', color: '#333' }}
-                    title="Filter op koepel">
-                    <option value="">Alle koepels</option>
-                    {koepelsInSeason.map(k => (
+                    title="Filter op reeks">
+                    <option value="">Alle reeksen</option>
+                    {seriesInSeason.map(k => (
                       <option key={k.id} value={k.id}>{k.name}</option>
                     ))}
-                    {hasUnassigned && <option value="none">— Zonder koepel —</option>}
+                    {hasUnassigned && <option value="none">— Zonder reeks —</option>}
                   </select>
                 );
               })()}
@@ -14329,7 +14590,7 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
               )}
             </>
           )}
-          {/* Portal-target: andere tabs (Partners, Koepels, ...) renderen hun knoppen hierin */}
+          {/* Portal-target: andere tabs (Wedstrijden, Partners, ...) renderen hun knoppen hierin */}
           <div id="pt-topbar-actions" style={{ display: 'flex', alignItems: 'center', gap: 8 }} />
         </div>
 
@@ -14345,17 +14606,17 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
                 <span style={{ fontSize: 12 }}>Klik op "+ Nieuw event" om er één aan te maken.</span>
               </div>
             ) : (() => {
-              // Pas de koepel-filter toe op de gerenderde lijst.
+              // Pas de reeks-filter toe op de gerenderde lijst.
               const filteredParcours = parcoursList.filter(p => {
-                if (koepelFilter === '') return true;
-                if (koepelFilter === 'none') return p.koepel_id == null;
-                return String(p.koepel_id) === String(koepelFilter);
+                if (seriesFilter === '') return true;
+                if (seriesFilter === 'none') return !p.series_slug;
+                return p.series_slug === seriesFilter;
               });
               if (filteredParcours.length === 0) {
                 return (
                   <div style={{ textAlign: 'center', color: 'var(--grey)', padding: 60, background: '#fff', borderRadius: 6, border: '1px solid var(--bdr)' }}>
                     Geen parcours die aan deze filter voldoen.<br />
-                    <button onClick={() => setKoepelFilter('')}
+                    <button onClick={() => setSeriesFilter('')}
                       style={{ marginTop: 8, padding: '6px 12px', background: '#fff', color: 'var(--blk4)', border: '1px solid var(--bdr)', borderRadius: 4, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>
                       Filter wissen
                     </button>
@@ -14372,9 +14633,9 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
                       onMouseEnter={(e) => e.currentTarget.style.borderColor = 'var(--grey)'}
                       onMouseLeave={(e) => e.currentTarget.style.borderColor = 'var(--bdr)'}
                     >
-                      {p.koepel_name && (
-                        <div style={{ fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.5px', color: p.koepel_color || '#888', marginBottom: 6 }}>
-                          {p.koepel_name}
+                      {p.series_name && (
+                        <div style={{ fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.5px', color: (seriesList.find(x => x.slug === p.series_slug) || {}).color || '#888', marginBottom: 6 }}>
+                          {p.series_name}
                         </div>
                       )}
                       <div style={{ fontSize: 15, fontWeight: 600, color: '#000', marginBottom: 4 }}>
@@ -14390,7 +14651,7 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
                         </button>
                         <button onClick={() => setEditMeta(p)}
                           style={{ padding: '6px 10px', background: '#fff', color: '#333', border: '1px solid var(--bdr)', borderRadius: 4, fontSize: 11, fontWeight: 600, cursor: 'pointer' }}
-                          title="Naam / datum / koepel wijzigen">
+                          title="Wedstrijd / datum / reeks wijzigen">
                           <Pen className="w-3.5 h-3.5" />
                         </button>
                         <button onClick={() => setDupSource(p)}
@@ -14413,12 +14674,12 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
           </>
         )}
         
-        {tab === 'partners' && (
-          <PartnersTab partners={partners} koepels={koepels} onReload={() => reloadAll(currentSeasonId)} />
+        {tab === 'wedstrijden' && (
+          <WedstrijdenTab user={user} />
         )}
         
-        {tab === 'koepels' && (
-          <KoepelsTab koepels={koepels} partners={partners} onReload={() => reloadAll(currentSeasonId)} />
+        {tab === 'partners' && (
+          <PartnersTab partners={partners} seriesList={seriesList} onReload={() => reloadAll(currentSeasonId)} />
         )}
         
         {tab === 'profiles' && (
@@ -14433,29 +14694,58 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
       {/* New parcours modal */}
       {showNew && (
         <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 500 }}>
-          <div style={{ background: '#fff', borderRadius: 8, padding: 24, width: 480, maxWidth: '94vw', boxShadow: '0 8px 40px rgba(0,0,0,0.25)' }}>
+          <div style={{ background: '#fff', borderRadius: 8, padding: 24, width: 520, maxWidth: '94vw', maxHeight: '92vh', overflowY: 'auto', boxShadow: '0 8px 40px rgba(0,0,0,0.25)' }}>
             <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 4 }}>Nieuw event</div>
-            <div style={{ fontSize: 12, color: 'var(--grey)', marginBottom: 16 }}>
-              Voor seizoen <strong>{seasons.find(s => s.id === currentSeasonId)?.label || ''}</strong>
+            <div style={{ fontSize: 12, color: 'var(--grey)', marginBottom: 14 }}>
+              Kies een wedstrijd uit de kalender. Locatie, datum en reeks volgen daaruit.
             </div>
             <form onSubmit={createParcours}>
-              <div style={{ marginBottom: 11 }}>
-                <label style={{ display: 'block', fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: 'var(--grey)', marginBottom: 4 }}>Koepel (optioneel)</label>
-                <select value={newKoepelId} onChange={(e) => setNewKoepelId(e.target.value)}
-                  style={{ width: '100%', padding: '7px 9px', border: '1px solid var(--bdr)', borderRadius: 5, fontSize: 13, background: '#fff', fontFamily: 'inherit' }}>
-                  <option value="">— geen koepel —</option>
-                  {koepels.map(k => <option key={k.id} value={k.id}>{k.name}</option>)}
-                </select>
-              </div>
-              <div style={{ marginBottom: 11 }}>
-                <label style={{ display: 'block', fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: 'var(--grey)', marginBottom: 4 }}>Locatie</label>
-                <input type="text" value={newLocation} onChange={(e) => setNewLocation(e.target.value)} required autoFocus placeholder="bv. Tabor, Koksijde..."
-                  style={{ width: '100%', padding: '7px 9px', border: '1px solid var(--bdr)', borderRadius: 5, fontSize: 13, fontFamily: 'inherit' }} />
-              </div>
-              <div style={{ marginBottom: 16 }}>
-                <label style={{ display: 'block', fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: 'var(--grey)', marginBottom: 4 }}>Wedstrijddatum</label>
-                <input type="date" value={newDate} onChange={(e) => setNewDate(e.target.value)} required
-                  style={{ width: '100%', padding: '7px 9px', border: '1px solid var(--bdr)', borderRadius: 5, fontSize: 13, fontFamily: 'inherit' }} />
+              <EditionPicker
+                required
+                value={newEdition ? newEdition.edition_id : null}
+                onPick={(row) => {
+                  setNewEdition(row);
+                  if (!row) { setNewLocation(''); setNewDate(''); return; }
+                  setNewLocation(row.start_location || row.event_name || '');
+                  if (row.event_date) setNewDate(row.event_date);
+                  // Reeks komt rechtstreeks uit de editie — niets meer af te leiden.
+                }}
+              />
+              {/* Locatie en datum komen uit de gekozen wedstrijd — niet los invulbaar. */}
+              <div style={{ marginBottom: 16, padding: '10px 12px', background: '#fafafa', border: '1px solid #f0f0ee', borderRadius: 6 }}>
+                <div style={{ display: 'flex', gap: 20 }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: 'var(--grey)', marginBottom: 3 }}>Locatie</div>
+                    <div style={{ fontSize: 13, color: newLocation ? 'var(--blk2)' : 'var(--lgrey)', fontWeight: newLocation ? 600 : 400 }}>
+                      {newLocation || '—'}
+                    </div>
+                  </div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: 'var(--grey)', marginBottom: 3 }}>Wedstrijddatum</div>
+                    <div style={{ fontSize: 13, color: newDate ? 'var(--blk2)' : 'var(--lgrey)', fontWeight: newDate ? 600 : 400 }}>
+                      {newDate ? fmtDate(newDate) : '—'}
+                    </div>
+                  </div>
+                </div>
+                {/* Reeks komt uit de gekozen wedstrijd. */}
+                <div style={{ marginTop: 10, paddingTop: 10, borderTop: '1px solid #ececea' }}>
+                  <div style={{ fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: 'var(--grey)', marginBottom: 3 }}>Reeks</div>
+                  {(() => {
+                    if (!newEdition) return <div style={{ fontSize: 13, color: 'var(--lgrey)' }}>—</div>;
+                    if (!newEdition.series_slug) return (
+                      <div style={{ fontSize: 12, color: 'var(--grey)' }}>
+                        Losse wedstrijd — hoort niet bij een reeks.
+                      </div>
+                    );
+                    const sr = seriesList.find(x => x.slug === newEdition.series_slug);
+                    return (
+                      <div style={{ fontSize: 13, color: 'var(--blk2)', fontWeight: 600, display: 'flex', alignItems: 'center', gap: 7 }}>
+                        <span style={{ width: 10, height: 10, borderRadius: 3, background: (sr && sr.color) || '#888', display: 'inline-block', flexShrink: 0 }} />
+                        {newEdition.series_name}
+                      </div>
+                    );
+                  })()}
+                </div>
               </div>
               {RoleCan.manageUsers(user?.role) && restrictedUsers.length > 0 && (
                 <div style={{ marginBottom: 16 }}>
@@ -14469,12 +14759,14 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
                 </div>
               )}
               <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-                <button type="button" onClick={() => { setShowNew(false); setNewAllowedUserIds([]); }}
+                <button type="button" onClick={() => { setShowNew(false); setNewAllowedUserIds([]); setNewEdition(null); }}
                   style={{ background: 'transparent', color: '#444', border: '1px solid var(--bdr)', padding: '8px 14px', borderRadius: 5, fontSize: 13, cursor: 'pointer' }}>
                   Annuleren
                 </button>
-                <button type="submit"
-                  style={{ background: '#E11D48', color: '#fff', border: 'none', padding: '8px 18px', borderRadius: 5, fontSize: 13, fontWeight: 600, cursor: 'pointer' }}>
+                <button type="submit" disabled={!newEdition}
+                  title={!newEdition ? 'Kies eerst een wedstrijd uit de kalender' : ''}
+                  style={{ background: '#E11D48', color: '#fff', border: 'none', padding: '8px 18px', borderRadius: 5, fontSize: 13, fontWeight: 600,
+                           cursor: newEdition ? 'pointer' : 'not-allowed', opacity: newEdition ? 1 : 0.45 }}>
                   Aanmaken
                 </button>
               </div>
@@ -14488,7 +14780,6 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
         <DuplicateModal
           source={dupSource}
           seasons={seasons}
-          koepels={koepels}
           onClose={() => setDupSource(null)}
           onDone={(id) => { setDupSource(null); reloadAll(currentSeasonId); onOpenParcours(id); }}
         />
@@ -14499,7 +14790,7 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
         <EditParcoursMetaModal
           parcours={editMeta}
           seasons={seasons}
-          koepels={koepels}
+          seriesList={seriesList}
           restrictedUsers={restrictedUsers}
           canManageUsers={RoleCan.manageUsers(user?.role)}
           onClose={() => setEditMeta(null)}
@@ -14511,11 +14802,173 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
   );
 }
 
-function EditParcoursMetaModal({ parcours, seasons, koepels, restrictedUsers = [], canManageUsers = false, onClose, onDone }) {
+// =================================================================
+// EditionPicker — kies een wedstrijd uit de wedstrijdendatabase
+// -----------------------------------------------------------------
+// Getrapt: seizoen (default = huidig) -> discipline (default veldrijden)
+// -> editie. Bij een keuze geeft onPick de volledige rij uit
+// flcs_calendar_v1 terug, of null als de gebruiker terugvalt op
+// vrije invoer.
+//
+// Props:
+//   value    — edition_id van de huidige selectie (of null)
+//   onPick   — (editionRow | null) => void
+//   compact  — minder marge, voor gebruik in een bestaande modal
+// =================================================================
+function EditionPicker({ value, onPick, compact = false, required = false }) {
+  const [seasons, setSeasons] = useState([]);
+  const [disciplines, setDisciplines] = useState([]);
+  const [editions, setEditions] = useState([]);
+  const [seasonId, setSeasonId] = useState('');
+  const [discipline, setDiscipline] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [loadingEditions, setLoadingEditions] = useState(false);
+  const [err, setErr] = useState(null);
+
+  // Eerste load: seizoenen + disciplines, en meteen de kalender van het
+  // huidige seizoen. Faalt dit (tabellen nog niet aangemaakt), dan valt
+  // het formulier stilletjes terug op vrije invoer.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const [s, d] = await Promise.all([api.cal.seasons(), api.cal.disciplines()]);
+        if (cancelled) return;
+        setSeasons(s.seasons);
+        setDisciplines(d.disciplines);
+
+        const cur = s.seasons.find(x => x.is_current) || s.seasons[0];
+        const sid = cur ? cur.id : '';
+        setSeasonId(sid);
+
+        const hasCross = d.disciplines.some(x => x.slug === 'veldrijden');
+        setDiscipline(hasCross ? 'veldrijden' : (d.disciplines[0] ? d.disciplines[0].slug : ''));
+
+        if (sid) {
+          const c = await api.cal.calendar(sid);
+          if (!cancelled) setEditions(c.editions);
+        }
+      } catch (e) {
+        if (!cancelled) setErr(e.message);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const switchSeason = async (sid) => {
+    setSeasonId(sid);
+    onPick(null);            // selectie vervalt bij een ander seizoen
+    if (!sid) { setEditions([]); return; }
+    setLoadingEditions(true);
+    try {
+      const c = await api.cal.calendar(sid);
+      setEditions(c.editions);
+    } catch (e) { setErr(e.message); }
+    finally { setLoadingEditions(false); }
+  };
+
+  // Afgelaste edities laten we staan — je wil er soms tóch een parcours
+  // voor bewaren — maar we markeren ze duidelijk.
+  const visible = editions.filter(e => !discipline || e.discipline === discipline);
+  const selected = editions.find(e => e.edition_id === value) || null;
+
+  const lbl = {
+    display: 'block', fontSize: 9, fontWeight: 700, textTransform: 'uppercase',
+    letterSpacing: '.4px', color: 'var(--grey)', marginBottom: 4,
+  };
+  const sel = {
+    width: '100%', padding: '7px 9px', border: '1px solid var(--bdr)',
+    borderRadius: 5, fontSize: 13, background: '#fff', fontFamily: 'inherit',
+  };
+  const gap = compact ? 9 : 11;
+
+  if (loading) {
+    return <div style={{ marginBottom: gap }}><ToolenInlineLoader text="Wedstrijden laden..." padding={16} size="sm" /></div>;
+  }
+
+  if (err) {
+    return (
+      <div style={{ marginBottom: gap, fontSize: 11.5, color: 'var(--amber)', background: '#fef3c7', padding: '8px 10px', borderRadius: 5 }}>
+        Wedstrijdendatabase niet bereikbaar — vul locatie en datum hieronder handmatig in.
+      </div>
+    );
+  }
+
+  return (
+    <div style={{
+      marginBottom: gap, padding: compact ? 0 : 12,
+      background: compact ? 'transparent' : '#fafafa',
+      border: compact ? 'none' : '1px solid #f0f0ee', borderRadius: 6,
+    }}>
+      <div style={{ display: 'flex', gap: 8, marginBottom: gap }}>
+        <div style={{ flex: 1 }}>
+          <label style={lbl}>Seizoen</label>
+          <select value={seasonId} onChange={e => switchSeason(e.target.value)} style={sel}>
+            {seasons.length === 0 && <option value="">Geen seizoenen</option>}
+            {seasons.map(s => (
+              <option key={s.id} value={s.id}>{s.label}{s.is_current ? ' (huidig)' : ''}</option>
+            ))}
+          </select>
+        </div>
+        <div style={{ flex: 1 }}>
+          <label style={lbl}>Discipline</label>
+          <select value={discipline} onChange={e => { setDiscipline(e.target.value); onPick(null); }} style={sel}>
+            <option value="">Alle</option>
+            {disciplines.map(d => <option key={d.slug} value={d.slug}>{d.name}</option>)}
+          </select>
+        </div>
+      </div>
+
+      <div>
+        <label style={lbl}>Wedstrijd</label>
+        <select
+          value={value || ''}
+          disabled={loadingEditions}
+          onChange={e => {
+            const row = editions.find(x => x.edition_id === e.target.value) || null;
+            onPick(row);
+          }}
+          style={sel}>
+          <option value="">{required ? '— kies een wedstrijd —' : '— geen wedstrijd, vrije invoer —'}</option>
+          {visible.map(e => (
+            <option key={e.edition_id} value={e.edition_id}>
+              {e.event_name}
+              {e.event_date ? ` — ${fmtDate(e.event_date)}` : ''}
+              {e.status === 'cancelled' ? ' (gaat niet door)' : ''}
+            </option>
+          ))}
+        </select>
+        {!loadingEditions && visible.length === 0 && (
+          <div style={{ fontSize: 10.5, color: 'var(--grey)', marginTop: 4 }}>
+            Geen wedstrijden in dit seizoen{discipline ? ' voor deze discipline' : ''}.
+            {required && <> Voeg er eerst een toe onder <strong>Wedstrijden</strong>.</>}
+          </div>
+        )}
+        {selected && (
+          <div style={{ fontSize: 10.5, color: 'var(--grey)', marginTop: 5, lineHeight: 1.5 }}>
+            {selected.series_name && <>{selected.series_name} · </>}
+            {selected.start_location || '?'} → {selected.finish_location || '?'}
+            {selected.stage_count > 0 && <> · {selected.stage_count} ritten</>}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function EditParcoursMetaModal({ parcours, seasons, seriesList = [], restrictedUsers = [], canManageUsers = false, onClose, onDone }) {
   const [location, setLocation] = useState(parcours.location_name);
   const [date, setDate] = useState(parcours.race_date);
   const [seasonId, setSeasonId] = useState(parcours.season_id);
-  const [koepelId, setKoepelId] = useState(parcours.koepel_id || '');
+  const [seriesSlug, setSeriesSlug] = useState(parcours.series_slug || null);
+  const [seriesName, setSeriesName] = useState(parcours.series_name || null);
+  const [editionId, setEditionId] = useState(parcours.edition_id || null);
+  const [editionSnap, setEditionSnap] = useState({
+    name: parcours.edition_event_name || null,
+    date: parcours.edition_event_date || null,
+  });
   const [allowedUserIds, setAllowedUserIds] = useState([]);
   const [allowedUsersLoaded, setAllowedUsersLoaded] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -14541,6 +14994,7 @@ function EditParcoursMetaModal({ parcours, seasons, koepels, restrictedUsers = [
   
   const submit = async (e) => {
     e.preventDefault();
+    if (!editionId) return;   // parcours hangt altijd aan een wedstrijd
     setBusy(true); setErr(null);
     try {
       const payload = {
@@ -14548,7 +15002,11 @@ function EditParcoursMetaModal({ parcours, seasons, koepels, restrictedUsers = [
         location_name: location.trim(),
         race_date: date,
         season_id: seasonId,
-        koepel_id: koepelId || null,
+        series_slug: seriesSlug || null,
+        series_name: seriesName || null,
+        edition_id: editionId || null,
+        edition_event_name: editionId ? editionSnap.name : null,
+        edition_event_date: editionId ? editionSnap.date : null,
       };
       // Toegangs-toewijzingen alleen meesturen als admin én de lijst is geladen
       // (anders zouden we per ongeluk een lege lijst doorgeven en alle
@@ -14566,35 +15024,63 @@ function EditParcoursMetaModal({ parcours, seasons, koepels, restrictedUsers = [
   
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 500 }}>
-      <div style={{ background: '#fff', borderRadius: 8, padding: 24, width: 480, maxWidth: '94vw', boxShadow: '0 8px 40px rgba(0,0,0,0.25)' }}>
-        <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 16 }}>Parcours bewerken</div>
+      <div style={{ background: '#fff', borderRadius: 8, padding: 24, width: 520, maxWidth: '94vw', maxHeight: '92vh', overflowY: 'auto', boxShadow: '0 8px 40px rgba(0,0,0,0.25)' }}>
+        <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 14 }}>Parcours bewerken</div>
         {err && <div style={{ background: '#fef2f2', color: '#c0392b', padding: '8px 10px', borderRadius: 5, marginBottom: 12, fontSize: 12, borderLeft: '3px solid #c0392b' }}>{err}</div>}
         <form onSubmit={submit}>
-          <div style={{ marginBottom: 11 }}>
-            <label style={{ display: 'block', fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: 'var(--grey)', marginBottom: 4 }}>Locatie</label>
-            <input type="text" value={location} onChange={(e) => setLocation(e.target.value)} required autoFocus
-              style={{ width: '100%', padding: '7px 9px', border: '1px solid var(--bdr)', borderRadius: 5, fontSize: 13, fontFamily: 'inherit' }} />
-          </div>
-          <div style={{ marginBottom: 11 }}>
-            <label style={{ display: 'block', fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: 'var(--grey)', marginBottom: 4 }}>Wedstrijddatum</label>
-            <input type="date" value={date} onChange={(e) => setDate(e.target.value)} required
-              style={{ width: '100%', padding: '7px 9px', border: '1px solid var(--bdr)', borderRadius: 5, fontSize: 13, fontFamily: 'inherit' }} />
-          </div>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 9, marginBottom: 16 }}>
-            <div>
-              <label style={{ display: 'block', fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: 'var(--grey)', marginBottom: 4 }}>Seizoen</label>
-              <select value={seasonId} onChange={(e) => setSeasonId(parseInt(e.target.value))}
-                style={{ width: '100%', padding: '7px 9px', border: '1px solid var(--bdr)', borderRadius: 5, fontSize: 13, fontFamily: 'inherit' }}>
-                {seasons.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}
-              </select>
+          <EditionPicker
+            required
+            value={editionId}
+            onPick={(row) => {
+              setEditionId(row ? row.edition_id : null);
+              setEditionSnap(row ? { name: row.event_name, date: row.event_date } : { name: null, date: null });
+              if (row) {
+                setLocation(row.start_location || row.event_name || '');
+                if (row.event_date) setDate(row.event_date);
+                const match = seasons.find(x => x.label === row.season_label);
+                if (match) setSeasonId(match.id);
+                // Reeks komt rechtstreeks uit de editie.
+                setSeriesSlug(row.series_slug || null);
+                setSeriesName(row.series_name || null);
+              }
+            }}
+          />
+          {/* Locatie, datum, seizoen en reeks volgen uit de gekozen wedstrijd. */}
+          <div style={{ marginBottom: 16, padding: '10px 12px', background: '#fafafa', border: '1px solid #f0f0ee', borderRadius: 6 }}>
+            <div style={{ display: 'flex', gap: 20 }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: 'var(--grey)', marginBottom: 3 }}>Locatie</div>
+                <div style={{ fontSize: 13, color: location ? 'var(--blk2)' : 'var(--lgrey)', fontWeight: location ? 600 : 400 }}>
+                  {location || '—'}
+                </div>
+              </div>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: 'var(--grey)', marginBottom: 3 }}>Wedstrijddatum</div>
+                <div style={{ fontSize: 13, color: date ? 'var(--blk2)' : 'var(--lgrey)', fontWeight: date ? 600 : 400 }}>
+                  {date ? fmtDate(date) : '—'}
+                </div>
+              </div>
             </div>
-            <div>
-              <label style={{ display: 'block', fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: 'var(--grey)', marginBottom: 4 }}>Koepel</label>
-              <select value={koepelId} onChange={(e) => setKoepelId(e.target.value)}
-                style={{ width: '100%', padding: '7px 9px', border: '1px solid var(--bdr)', borderRadius: 5, fontSize: 13, fontFamily: 'inherit' }}>
-                <option value="">— geen koepel —</option>
-                {koepels.map(k => <option key={k.id} value={k.id}>{k.name}</option>)}
-              </select>
+            <div style={{ marginTop: 10, paddingTop: 10, borderTop: '1px solid #ececea', display: 'flex', gap: 20 }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: 'var(--grey)', marginBottom: 3 }}>Seizoen</div>
+                <div style={{ fontSize: 13, color: 'var(--blk2)', fontWeight: 600 }}>
+                  {(seasons.find(x => x.id === seasonId) || {}).label || '—'}
+                </div>
+              </div>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: 'var(--grey)', marginBottom: 3 }}>Reeks</div>
+                {(() => {
+                  if (!seriesSlug) return <div style={{ fontSize: 12, color: 'var(--grey)' }}>Losse wedstrijd</div>;
+                  const sr = seriesList.find(x => x.slug === seriesSlug);
+                  return (
+                    <div style={{ fontSize: 13, color: 'var(--blk2)', fontWeight: 600, display: 'flex', alignItems: 'center', gap: 7 }}>
+                      <span style={{ width: 10, height: 10, borderRadius: 3, background: (sr && sr.color) || '#888', display: 'inline-block', flexShrink: 0 }} />
+                      {seriesName || seriesSlug}
+                    </div>
+                  );
+                })()}
+              </div>
             </div>
           </div>
           {canManageUsers && restrictedUsers.length > 0 && (
@@ -14614,8 +15100,10 @@ function EditParcoursMetaModal({ parcours, seasons, koepels, restrictedUsers = [
               style={{ background: 'transparent', color: '#444', border: '1px solid var(--bdr)', padding: '8px 14px', borderRadius: 5, fontSize: 13, cursor: 'pointer' }}>
               Annuleren
             </button>
-            <button type="submit" disabled={busy}
-              style={{ background: '#E11D48', color: '#fff', border: 'none', padding: '8px 18px', borderRadius: 5, fontSize: 13, fontWeight: 600, cursor: busy ? 'wait' : 'pointer', opacity: busy ? 0.6 : 1 }}>
+            <button type="submit" disabled={busy || !editionId}
+              title={!editionId ? 'Koppel eerst een wedstrijd uit de kalender' : ''}
+              style={{ background: '#E11D48', color: '#fff', border: 'none', padding: '8px 18px', borderRadius: 5, fontSize: 13, fontWeight: 600,
+                       cursor: busy ? 'wait' : (editionId ? 'pointer' : 'not-allowed'), opacity: (busy || !editionId) ? 0.5 : 1 }}>
               {busy ? 'Bezig...' : 'Opslaan'}
             </button>
           </div>
@@ -14626,25 +15114,25 @@ function EditParcoursMetaModal({ parcours, seasons, koepels, restrictedUsers = [
 }
 
 // =================================================================
-// NewPartnerModal — invoer voor nieuwe partner (koepel of lokaal)
+// NewPartnerModal — invoer voor nieuwe partner (reeks of lokaal)
 // Verschilt per mode:
-//  - 'koepel': koepel-checkboxes zichtbaar, partner wordt gekoppeld aan
-//    gekozen koepel(s) en automatisch toegevoegd aan bestaande parcoursen
-//    van die koepel(s).
-//  - 'lokaal': geen koepel-veld; partner moet handmatig per parcours
+//  - 'reeks': reeks-checkboxes zichtbaar, partner wordt gekoppeld aan
+//    gekozen reeks(en) en automatisch toegevoegd aan bestaande parcoursen
+//    van die reeks(en).
+//  - 'lokaal': geen reeks-veld; partner moet handmatig per parcours
 //    worden toegevoegd.
 // =================================================================
-function NewPartnerModal({ mode, koepels, onClose, onCreated }) {
-  const isKoepel = mode === 'koepel';
+function NewPartnerModal({ mode, seriesList = [], onClose, onCreated }) {
+  const isSeries = mode === 'reeks';
   const [name, setName] = useState('');
   const [color, setColor] = useState('#888888');
-  const [selectedKoepelIds, setSelectedKoepelIds] = useState([]);
+  const [selectedSlugs, setSelectedSlugs] = useState([]);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
   
-  const toggleKoepel = (id) => {
-    setSelectedKoepelIds(prev =>
-      prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]
+  const toggleSeries = (slug) => {
+    setSelectedSlugs(prev =>
+      prev.includes(slug) ? prev.filter(x => x !== slug) : [...prev, slug]
     );
   };
   
@@ -14659,8 +15147,8 @@ function NewPartnerModal({ mode, koepels, onClose, onCreated }) {
       await api.createPartner({
         name: trimmed,
         color,
-        is_local: !isKoepel,
-        koepel_ids: isKoepel ? selectedKoepelIds : [],
+        is_local: !isSeries,
+        series_slugs: isSeries ? selectedSlugs : [],
       });
       onCreated();
     } catch (ex) {
@@ -14676,9 +15164,9 @@ function NewPartnerModal({ mode, koepels, onClose, onCreated }) {
     return () => window.removeEventListener('keydown', onKey);
   }, [busy, onClose]);
   
-  const title = isKoepel ? 'Nieuwe koepel-partner' : 'Nieuwe lokale partner';
-  const subtitle = isKoepel
-    ? 'Wordt automatisch toegevoegd aan bestaande én nieuwe parcoursen van de gekozen koepel(s).'
+  const title = isSeries ? 'Nieuwe reeks-partner' : 'Nieuwe lokale partner';
+  const subtitle = isSeries
+    ? 'Wordt automatisch toegevoegd aan bestaande én nieuwe parcoursen van de gekozen reeks(en).'
     : 'Lokale partner — moet je per parcours apart toevoegen.';
   
   return (
@@ -14694,7 +15182,7 @@ function NewPartnerModal({ mode, koepels, onClose, onCreated }) {
           <div style={{ marginBottom: 11 }}>
             <label style={{ display: 'block', fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: 'var(--grey)', marginBottom: 4 }}>Naam</label>
             <input type="text" value={name} onChange={(e) => setName(e.target.value)} required autoFocus
-              placeholder={isKoepel ? 'bv. Bingoal' : 'bv. De Ceuster'}
+              placeholder={isSeries ? 'bv. Bingoal' : 'bv. De Ceuster'}
               style={{ width: '100%', padding: '7px 9px', border: '1px solid var(--bdr)', borderRadius: 5, fontSize: 13, fontFamily: 'inherit' }} />
           </div>
           <div style={{ marginBottom: 16 }}>
@@ -14706,21 +15194,21 @@ function NewPartnerModal({ mode, koepels, onClose, onCreated }) {
                 style={{ width: 100, padding: '7px 9px', border: '1px solid var(--bdr)', borderRadius: 5, fontSize: 13, fontFamily: 'monospace' }} />
             </div>
           </div>
-          {isKoepel && (
+          {isSeries && (
             <div style={{ marginBottom: 16 }}>
               <label style={{ display: 'block', fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: 'var(--grey)', marginBottom: 6 }}>
-                Hoort bij koepel(s)
+                Hoort bij reeks(en)
               </label>
-              {koepels.length === 0 ? (
+              {seriesList.length === 0 ? (
                 <div style={{ fontSize: 12, color: 'var(--grey)', fontStyle: 'italic', padding: 8, background: '#f9fafb', borderRadius: 5, border: '1px solid var(--bdr)' }}>
-                  Nog geen koepels aangemaakt — je kan deze partner later koppelen via de Koepels-tab.
+                  Nog geen reeksen aangemaakt — je kan deze partner later koppelen via Wedstrijden → Reeksen.
                 </div>
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 220, overflowY: 'auto', border: '1px solid var(--bdr)', borderRadius: 5, padding: 6 }}>
-                  {koepels.map(k => {
-                    const checked = selectedKoepelIds.includes(k.id);
+                  {seriesList.map(k => {
+                    const checked = selectedSlugs.includes(k.slug);
                     return (
-                      <label key={k.id}
+                      <label key={k.slug}
                         style={{
                           display: 'flex', alignItems: 'center', gap: 8,
                           padding: '6px 8px', borderRadius: 4, cursor: 'pointer',
@@ -14729,7 +15217,7 @@ function NewPartnerModal({ mode, koepels, onClose, onCreated }) {
                         onMouseEnter={(e) => { if (!checked) e.currentTarget.style.background = '#fafafa'; }}
                         onMouseLeave={(e) => { if (!checked) e.currentTarget.style.background = 'transparent'; }}
                       >
-                        <input type="checkbox" checked={checked} onChange={() => toggleKoepel(k.id)} />
+                        <input type="checkbox" checked={checked} onChange={() => toggleSeries(k.slug)} />
                         <span style={{ width: 14, height: 14, borderRadius: 3, background: k.color || '#888' }} />
                         <span style={{ fontSize: 13 }}>{k.name}</span>
                       </label>
@@ -14767,20 +15255,20 @@ function TopbarActions({ children }) {
   return el ? ReactDOM.createPortal(children, el) : null;
 }
 
-// PartnersTab — manage all partners (koepel + lokaal)
+// PartnersTab — manage all partners (reeks + lokaal)
 // =================================================================
-function PartnersTab({ partners, koepels, onReload }) {
-  const [filter, setFilter] = useState('all'); // all | koepel | lokaal
+function PartnersTab({ partners, seriesList = [], onReload }) {
+  const [filter, setFilter] = useState('all'); // all | reeks | lokaal
   const [busy, setBusy] = useState(null); // partner id currently saving
-  const [newPartnerMode, setNewPartnerMode] = useState(null); // null | 'koepel' | 'lokaal'
+  const [newPartnerMode, setNewPartnerMode] = useState(null); // null | 'reeks' | 'lokaal'
   
   const filtered = partners.filter(p => {
-    if (filter === 'koepel') return !p.is_local;
+    if (filter === 'reeks') return !p.is_local;
     if (filter === 'lokaal') return p.is_local;
     return true;
   });
   
-  // (addPartner verwijderd — toevoegen gaat nu via NewPartnerModal voor zowel koepel als lokaal)
+  // (addPartner verwijderd — toevoegen gaat nu via NewPartnerModal voor zowel reeks als lokaal)
   
   const updatePartner = async (id, updates) => {
     setBusy(id);
@@ -14807,7 +15295,7 @@ function PartnersTab({ partners, koepels, onReload }) {
     <>
       <TopbarActions>
         <div style={{ display: 'flex', gap: 4 }}>
-          {[{id:'all',label:'Alle'},{id:'koepel',label:'Koepel'},{id:'lokaal',label:'Lokaal'}].map(f => (
+          {[{id:'all',label:'Alle'},{id:'reeks',label:'Reeks'},{id:'lokaal',label:'Lokaal'}].map(f => (
             <button key={f.id} onClick={() => setFilter(f.id)}
               style={{
                 padding: '5px 11px', borderRadius: 20, fontSize: 11, fontWeight: 600, cursor: 'pointer',
@@ -14819,9 +15307,9 @@ function PartnersTab({ partners, koepels, onReload }) {
             </button>
           ))}
         </div>
-        <button onClick={() => setNewPartnerMode('koepel')}
+        <button onClick={() => setNewPartnerMode('reeks')}
           style={{ background: '#E11D48', color: '#fff', border: '1px solid #E11D48', padding: '6px 12px', borderRadius: 5, fontSize: 12, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap' }}>
-          + Koepel-partner
+          + Reeks-partner
         </button>
         <button onClick={() => setNewPartnerMode('lokaal')}
           style={{ background: 'transparent', color: 'var(--blk)', border: '1px solid var(--bdr)', padding: '6px 12px', borderRadius: 5, fontSize: 12, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap' }}>
@@ -14829,13 +15317,13 @@ function PartnersTab({ partners, koepels, onReload }) {
         </button>
       </TopbarActions>
       <div style={{ fontSize: 12, color: 'var(--grey)', marginBottom: 16 }}>
-        Beheer alle partners. Koepel-partners verschijnen automatisch bij hun koepel-parcoursen, lokale partners moet je per parcours kiezen.
+        Beheer alle partners. Reeks-partners verschijnen automatisch bij elk parcours van hun reeks, lokale partners kies je per parcours.
       </div>
       
       {newPartnerMode && (
         <NewPartnerModal
           mode={newPartnerMode}
-          koepels={koepels}
+          seriesList={seriesList}
           onClose={() => setNewPartnerMode(null)}
           onCreated={() => { setNewPartnerMode(null); onReload(); }}
         />
@@ -14899,11 +15387,11 @@ function PartnerEditRow({ partner, busy, onUpdate, onDelete, isLast }) {
         onMouseLeave={(e) => { if (document.activeElement !== e.target) { e.target.style.borderColor = 'transparent'; e.target.style.background = 'transparent'; } }}
       />
       
-      {/* Koepel-pills (alleen voor koepel-partners) */}
+      {/* Reeks-pills (alleen voor reeks-partners) */}
       <div style={{ flex: 1, minWidth: 0, display: 'flex', flexWrap: 'wrap', gap: 4, alignItems: 'center' }}>
-        {!partner.is_local && Array.isArray(partner.koepels) && partner.koepels.length > 0 && (
-          partner.koepels.map(k => (
-            <span key={k.id} title={k.name}
+        {!partner.is_local && Array.isArray(partner.series) && partner.series.length > 0 && (
+          partner.series.map(k => (
+            <span key={k.slug} title={k.name}
               style={{
                 display: 'inline-flex', alignItems: 'center', gap: 5,
                 padding: '3px 8px', borderRadius: 12,
@@ -14915,8 +15403,8 @@ function PartnerEditRow({ partner, busy, onUpdate, onDelete, isLast }) {
             </span>
           ))
         )}
-        {!partner.is_local && (!partner.koepels || partner.koepels.length === 0) && (
-          <span style={{ fontSize: 11, color: 'var(--lgrey)', fontStyle: 'italic' }}>geen koepel</span>
+        {!partner.is_local && (!partner.series || partner.series.length === 0) && (
+          <span style={{ fontSize: 11, color: 'var(--lgrey)', fontStyle: 'italic' }}>geen reeks</span>
         )}
         {/* Event-pills: aan welke events (parcoursen) deze partner gekoppeld is */}
         {Array.isArray(partner.events) && partner.events.length > 0 && partner.events.map(ev => (
@@ -14935,7 +15423,7 @@ function PartnerEditRow({ partner, busy, onUpdate, onDelete, isLast }) {
       
       {/* Type badge */}
       <div style={{ fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: partner.is_local ? 'var(--amber)' : 'var(--blue)', flexShrink: 0 }}>
-        {partner.is_local ? 'Lokaal' : 'Koepel'}
+        {partner.is_local ? 'Lokaal' : 'Reeks'}
       </div>
       
       {/* Delete */}
@@ -14943,171 +15431,6 @@ function PartnerEditRow({ partner, busy, onUpdate, onDelete, isLast }) {
         style={{ padding: 6, background: 'transparent', border: 'none', color: 'var(--red)', cursor: 'pointer', flexShrink: 0 }}>
         <Trash2 className="w-4 h-4" />
       </button>
-    </div>
-  );
-}
-
-// =================================================================
-// KoepelsTab — manage koepels and their default partners
-// =================================================================
-function KoepelsTab({ koepels, partners, onReload }) {
-  const [editingKoepel, setEditingKoepel] = useState(null); // koepel id whose partners are being edited
-  
-  const addKoepel = async () => {
-    const name = prompt('Naam van de nieuwe koepel:');
-    if (!name) return;
-    try {
-      await api.createKoepel({ name, color: '#1c1917' });
-      onReload();
-    } catch (e) { alert('Kon koepel niet aanmaken: ' + e.message); }
-  };
-  
-  const updateKoepel = async (id, updates) => {
-    try { await api.updateKoepel({ id, ...updates }); onReload(); }
-    catch (e) { alert('Update mislukt: ' + e.message); }
-  };
-  
-  const deleteKoepel = async (id, name) => {
-    if (!confirm(`Koepel "${name}" verwijderen? Bestaande parcoursen blijven, maar verliezen hun koepel-koppeling.`)) return;
-    try { await api.deleteKoepel(id); onReload(); }
-    catch (e) { alert('Verwijderen mislukt: ' + e.message); }
-  };
-  
-  const koepelPartners = partners.filter(p => !p.is_local);
-  
-  return (
-    <>
-      <TopbarActions>
-        <button onClick={addKoepel}
-          style={{ background: '#E11D48', color: '#fff', border: '1px solid #E11D48', padding: '6px 12px', borderRadius: 5, fontSize: 12, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap' }}>
-          + Nieuwe koepel
-        </button>
-      </TopbarActions>
-      <div style={{ fontSize: 12, color: 'var(--grey)', marginBottom: 16 }}>
-        Beheer wedstrijdklassementen. Koppel standaard-partners die automatisch verschijnen bij elk parcours van die koepel.
-      </div>
-      
-      {koepels.length === 0 ? (
-        <div style={{ textAlign: 'center', color: 'var(--grey)', padding: 60, background: '#fff', borderRadius: 6, border: '1px solid var(--bdr)' }}>
-          Nog geen koepels.
-        </div>
-      ) : (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          {koepels.map(k => (
-            <KoepelCard
-              key={k.id}
-              koepel={k}
-              koepelPartners={koepelPartners}
-              isEditing={editingKoepel === k.id}
-              onToggleEdit={() => setEditingKoepel(editingKoepel === k.id ? null : k.id)}
-              onUpdate={(updates) => updateKoepel(k.id, updates)}
-              onDelete={() => deleteKoepel(k.id, k.name)}
-            />
-          ))}
-        </div>
-      )}
-    </>
-  );
-}
-
-function KoepelCard({ koepel, koepelPartners, isEditing, onToggleEdit, onUpdate, onDelete }) {
-  const [name, setName] = useState(koepel.name);
-  const [shortName, setShortName] = useState(koepel.short_name || '');
-  const [color, setColor] = useState(koepel.color);
-  const [selectedPartnerIds, setSelectedPartnerIds] = useState(new Set(koepel.partners.map(p => p.id)));
-  
-  useEffect(() => {
-    setName(koepel.name);
-    setShortName(koepel.short_name || '');
-    setColor(koepel.color);
-    setSelectedPartnerIds(new Set(koepel.partners.map(p => p.id)));
-  }, [koepel.id, koepel.name, koepel.short_name, koepel.color, koepel.partners.map(p => p.id).join(',')]);
-  
-  const togglePartner = (pid) => {
-    const next = new Set(selectedPartnerIds);
-    if (next.has(pid)) next.delete(pid); else next.add(pid);
-    setSelectedPartnerIds(next);
-  };
-  
-  const savePartners = () => {
-    onUpdate({ partner_ids: Array.from(selectedPartnerIds) });
-  };
-  
-  const saveBasics = () => {
-    const changes = {};
-    if (name !== koepel.name) changes.name = name;
-    if (shortName !== (koepel.short_name || '')) changes.short_name = shortName;
-    if (color !== koepel.color) changes.color = color;
-    if (Object.keys(changes).length > 0) onUpdate(changes);
-  };
-  
-  return (
-    <div style={{ background: '#fff', border: '1px solid var(--bdr)', borderRadius: 6, overflow: 'hidden' }}>
-      {/* Header row */}
-      <div style={{ padding: '12px 16px', display: 'flex', alignItems: 'center', gap: 12, borderBottom: isEditing ? '1px solid var(--bdr)' : 'none' }}>
-        <label style={{ position: 'relative', width: 24, height: 24, flexShrink: 0, cursor: 'pointer' }}>
-          <input type="color" value={color}
-            onChange={(e) => setColor(e.target.value)}
-            onBlur={saveBasics}
-            style={{ position: 'absolute', inset: 0, opacity: 0, cursor: 'pointer' }} />
-          <div style={{ width: 24, height: 24, borderRadius: 5, background: color, border: '1px solid var(--bdr)' }} />
-        </label>
-        <input type="text" value={name}
-          onChange={(e) => setName(e.target.value)}
-          onBlur={saveBasics}
-          onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur(); }}
-          style={{ flex: 1, padding: '5px 8px', border: '1px solid transparent', borderRadius: 4, fontSize: 14, fontWeight: 600, fontFamily: 'inherit', minWidth: 0, background: 'transparent' }}
-          onFocus={(e) => { e.target.style.borderColor = 'var(--bdr)'; e.target.style.background = '#fafafa'; }}
-        />
-        <input type="text" value={shortName} placeholder="afk."
-          onChange={(e) => setShortName(e.target.value)}
-          onBlur={saveBasics}
-          style={{ width: 80, padding: '5px 8px', border: '1px solid var(--bdr)', borderRadius: 4, fontSize: 12, fontFamily: 'inherit', textAlign: 'center', color: 'var(--grey)' }}
-        />
-        <div style={{ fontSize: 11, color: 'var(--grey)', marginRight: 12 }}>
-          {koepel.partners.length} partner{koepel.partners.length !== 1 ? 's' : ''}
-        </div>
-        <button onClick={onToggleEdit}
-          style={{ padding: '5px 11px', background: isEditing ? 'var(--blk)' : '#fff', color: isEditing ? '#fff' : 'var(--blk4)', border: '1px solid ' + (isEditing ? 'var(--blk)' : 'var(--bdr)'), fontSize: 11, fontWeight: 600, borderRadius: 4, cursor: 'pointer' }}>
-          {isEditing ? 'Sluit' : 'Partners'}
-        </button>
-        <button onClick={onDelete} title="Koepel verwijderen"
-          style={{ padding: 6, background: 'transparent', border: 'none', color: 'var(--red)', cursor: 'pointer' }}>
-          <Trash2 className="w-4 h-4" />
-        </button>
-      </div>
-      
-      {/* Partner picker */}
-      {isEditing && (
-        <div style={{ padding: 16, background: 'var(--xxlgrey)' }}>
-          <div style={{ fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: 'var(--grey)', marginBottom: 10 }}>
-            Welke partners horen standaard bij deze koepel?
-          </div>
-          {koepelPartners.length === 0 ? (
-            <div style={{ fontSize: 12, color: 'var(--grey)' }}>
-              Nog geen koepel-partners aangemaakt. Ga naar het Partners-tabblad om er aan te maken.
-            </div>
-          ) : (
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: 6, marginBottom: 12 }}>
-              {koepelPartners.map(p => (
-                <label key={p.id}
-                  style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 10px', background: '#fff', border: '1px solid var(--bdr)', borderRadius: 4, cursor: 'pointer', fontSize: 12 }}
-                >
-                  <input type="checkbox" checked={selectedPartnerIds.has(p.id)} onChange={() => togglePartner(p.id)} />
-                  <div style={{ width: 12, height: 12, borderRadius: 3, background: p.color, flexShrink: 0 }} />
-                  <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.name}</span>
-                </label>
-              ))}
-            </div>
-          )}
-          <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-            <button onClick={savePartners}
-              style={{ padding: '6px 14px', background: '#E11D48', color: '#fff', border: 'none', borderRadius: 4, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>
-              Bewaar koppelingen
-            </button>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
@@ -15333,6 +15656,1328 @@ function ExportProfilesTab() {
         </div>
       )}
     </>
+  );
+}
+
+// =================================================================
+// WedstrijdenTab — beheer van de wedstrijdendatabase (flcs_*)
+// -----------------------------------------------------------------
+// Vier subtabs:
+//   Kalender    — edities per seizoen: gaat hij door, wanneer, waar, welke reeks
+//   Wedstrijden — de tijdloze identiteit (naam + discipline)
+//   Reeksen     — Superprestige, X2O Trofee, ...
+//   Seizoenen   — labels waaraan edities hangen
+//
+// Deze tab praat uitsluitend met api.cal.* — bij de verhuizing naar de
+// FLCS-toolkit-DB hoeft hier niets te veranderen.
+// =================================================================
+function WedstrijdenTab({ user }) {
+  const [sub, setSub] = useState('kalender'); // kalender | wedstrijden | reeksen | seizoenen
+
+  const [seasons, setSeasons] = useState([]);
+  const [series, setSeries]   = useState([]);
+  const [events, setEvents]   = useState([]);
+  const [disciplines, setDisciplines] = useState([]);
+  // Partners per reeks (lokaal) + de volledige partnerlijst voor de picker
+  const [seriesPartners, setSeriesPartners] = useState({});
+  const [allPartners, setAllPartners] = useState([]);
+  const [partnersFor, setPartnersFor] = useState(null); // reeks waarvan partners bewerkt worden
+  const [editions, setEditions] = useState([]);
+  const [seasonId, setSeasonId] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState(null);
+
+  // Filters op de kalender
+  const [fDiscipline, setFDiscipline] = useState('');
+  const [fSeries, setFSeries] = useState('');
+  const [fStatus, setFStatus] = useState('');
+
+  // Modals
+  const [editionModal, setEditionModal] = useState(null); // {mode:'new'|'edit', edition?}
+  const [stagesFor, setStagesFor]       = useState(null); // editie-rij uit de view
+  const [eventModal, setEventModal]     = useState(null);
+  const [seriesModal, setSeriesModal]   = useState(null);
+  const [seasonModal, setSeasonModal]   = useState(null);
+  const [discModal, setDiscModal]       = useState(null);
+
+  const canEdit = user?.role === 'admin' || user?.role === 'editor';
+
+  const loadBase = async (keepSeasonId = null) => {
+    const [s, sr, ev, di, sp, pa] = await Promise.all([
+      api.cal.seasons(), api.cal.series(), api.cal.events(), api.cal.disciplines(),
+      api.cal.seriesPartners(), api.partners(),
+    ]);
+    setSeasons(s.seasons);
+    setSeries(sr.series);
+    setEvents(ev.events);
+    setDisciplines(di.disciplines);
+    setSeriesPartners(sp.bySeries || {});
+    setAllPartners((pa.partners || []).filter(p => !p.is_local));
+    let sid = keepSeasonId || seasonId;
+    if (!sid || !s.seasons.some(x => x.id === sid)) {
+      const cur = s.seasons.find(x => x.is_current);
+      sid = cur ? cur.id : (s.seasons[0] ? s.seasons[0].id : null);
+    }
+    setSeasonId(sid);
+    return sid;
+  };
+
+  const loadCalendar = async (sid) => {
+    if (!sid) { setEditions([]); return; }
+    const c = await api.cal.calendar(sid);
+    setEditions(c.editions);
+  };
+
+  const reloadAll = async (keepSeasonId = null) => {
+    setLoading(true); setErr(null);
+    try {
+      const sid = await loadBase(keepSeasonId);
+      await loadCalendar(sid);
+    } catch (e) { setErr(e.message); }
+    finally { setLoading(false); }
+  };
+
+  useEffect(() => { reloadAll(); }, []);
+
+  const switchSeason = async (sid) => {
+    setSeasonId(sid);
+    setLoading(true);
+    try { await loadCalendar(sid); }
+    catch (e) { setErr(e.message); }
+    finally { setLoading(false); }
+  };
+
+  const filtered = editions.filter(e => {
+    if (fDiscipline && e.discipline !== fDiscipline) return false;
+    if (fSeries === 'none' ? e.series_id : (fSeries && e.series_id !== fSeries)) return false;
+    if (fStatus && e.status !== fStatus) return false;
+    return true;
+  });
+
+  const removeEdition = async (ed) => {
+    if (!confirm(`Editie "${ed.event_name}" uit dit seizoen verwijderen?`)) return;
+    try { await api.cal.deleteEdition(ed.edition_id); await loadCalendar(seasonId); }
+    catch (e) { alert('Verwijderen mislukt: ' + e.message); }
+  };
+
+  const quickStatus = async (ed, status) => {
+    try {
+      await api.cal.updateEdition(ed.edition_id, { status });
+      await loadCalendar(seasonId);
+    } catch (e) { alert('Status wijzigen mislukt: ' + e.message); }
+  };
+
+  const SUBS = [
+    { id: 'kalender',    label: 'Kalender' },
+    { id: 'wedstrijden', label: 'Wedstrijden' },
+    { id: 'reeksen',     label: 'Reeksen' },
+    { id: 'disciplines', label: 'Disciplines' },
+    { id: 'seizoenen',   label: 'Seizoenen' },
+  ];
+
+  return (
+    <>
+      <TopbarActions>
+        <div style={{ display: 'flex', gap: 4 }}>
+          {SUBS.map(s => (
+            <button key={s.id} onClick={() => setSub(s.id)}
+              style={{
+                padding: '5px 11px', borderRadius: 20, fontSize: 11, fontWeight: 600, cursor: 'pointer',
+                background: sub === s.id ? '#1d1d1b' : '#fff',
+                color:      sub === s.id ? '#fff' : 'var(--blk4)',
+                border: '1px solid ' + (sub === s.id ? '#1d1d1b' : 'var(--bdr)'),
+              }}>
+              {s.label}
+            </button>
+          ))}
+        </div>
+        {canEdit && sub === 'kalender' && (
+          <button onClick={() => setEditionModal({ mode: 'new' })}
+            style={{ background: '#E11D48', color: '#fff', border: '1px solid #E11D48', padding: '6px 12px', borderRadius: 5, fontSize: 12, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap' }}>
+            + Editie
+          </button>
+        )}
+        {canEdit && sub === 'wedstrijden' && (
+          <button onClick={() => setEventModal({ mode: 'new' })}
+            style={{ background: '#E11D48', color: '#fff', border: '1px solid #E11D48', padding: '6px 12px', borderRadius: 5, fontSize: 12, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap' }}>
+            + Wedstrijd
+          </button>
+        )}
+        {canEdit && sub === 'reeksen' && (
+          <button onClick={() => setSeriesModal({ mode: 'new' })}
+            style={{ background: '#E11D48', color: '#fff', border: '1px solid #E11D48', padding: '6px 12px', borderRadius: 5, fontSize: 12, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap' }}>
+            + Reeks
+          </button>
+        )}
+        {canEdit && sub === 'disciplines' && (
+          <button onClick={() => setDiscModal({ mode: 'new' })}
+            style={{ background: '#E11D48', color: '#fff', border: '1px solid #E11D48', padding: '6px 12px', borderRadius: 5, fontSize: 12, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap' }}>
+            + Discipline
+          </button>
+        )}
+        {canEdit && sub === 'seizoenen' && (
+          <button onClick={() => setSeasonModal({ mode: 'new' })}
+            style={{ background: '#E11D48', color: '#fff', border: '1px solid #E11D48', padding: '6px 12px', borderRadius: 5, fontSize: 12, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap' }}>
+            + Seizoen
+          </button>
+        )}
+      </TopbarActions>
+
+      {err && (
+        <div style={{ background: '#fee2e2', color: '#b91c1c', padding: '10px 12px', borderRadius: 5, fontSize: 12, marginBottom: 14 }}>
+          {err}
+        </div>
+      )}
+
+      {loading ? <ToolenInlineLoader text="Wedstrijden laden..." /> : (
+        <>
+          {/* ---------------- KALENDER ---------------- */}
+          {sub === 'kalender' && (
+            <>
+              <div style={{ fontSize: 12, color: 'var(--grey)', marginBottom: 14 }}>
+                Per seizoen: gaat de wedstrijd door, wanneer, waar start en finisht hij, en tot welke reeks hij behoort.
+              </div>
+
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 14 }}>
+                <select value={seasonId || ''} onChange={e => switchSeason(e.target.value)}
+                  style={{ padding: '6px 9px', border: '1px solid var(--bdr)', borderRadius: 5, fontSize: 12, fontFamily: 'inherit', background: '#fff' }}>
+                  {seasons.length === 0 && <option value="">Geen seizoenen</option>}
+                  {seasons.map(s => (
+                    <option key={s.id} value={s.id}>{s.label}{s.is_current ? ' (huidig)' : ''}</option>
+                  ))}
+                </select>
+
+                <select value={fDiscipline} onChange={e => setFDiscipline(e.target.value)}
+                  style={{ padding: '6px 9px', border: '1px solid var(--bdr)', borderRadius: 5, fontSize: 12, fontFamily: 'inherit', background: '#fff' }}>
+                  <option value="">Alle disciplines</option>
+                  {disciplines.map(d => <option key={d.slug} value={d.slug}>{d.name}</option>)}
+                </select>
+
+                <select value={fSeries} onChange={e => setFSeries(e.target.value)}
+                  style={{ padding: '6px 9px', border: '1px solid var(--bdr)', borderRadius: 5, fontSize: 12, fontFamily: 'inherit', background: '#fff' }}>
+                  <option value="">Alle reeksen</option>
+                  <option value="none">Zonder reeks</option>
+                  {series.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                </select>
+
+                <select value={fStatus} onChange={e => setFStatus(e.target.value)}
+                  style={{ padding: '6px 9px', border: '1px solid var(--bdr)', borderRadius: 5, fontSize: 12, fontFamily: 'inherit', background: '#fff' }}>
+                  <option value="">Alle statussen</option>
+                  {EDITION_STATUS.map(s => <option key={s.value} value={s.value}>{s.label}</option>)}
+                </select>
+
+                <span style={{ fontSize: 11, color: 'var(--grey)', marginLeft: 'auto' }}>
+                  {filtered.length} {filtered.length === 1 ? 'editie' : 'edities'}
+                </span>
+              </div>
+
+              {seasons.length === 0 ? (
+                <div style={{ background: '#fff', border: '1px solid var(--bdr)', borderRadius: 6, padding: 30, textAlign: 'center', fontSize: 13, color: 'var(--grey)' }}>
+                  Maak eerst een seizoen aan onder de tab <strong>Seizoenen</strong>.
+                </div>
+              ) : filtered.length === 0 ? (
+                <div style={{ background: '#fff', border: '1px solid var(--bdr)', borderRadius: 6, padding: 30, textAlign: 'center', fontSize: 13, color: 'var(--grey)' }}>
+                  Geen edities in dit seizoen{(fDiscipline || fSeries || fStatus) ? ' met deze filters' : ''}.
+                </div>
+              ) : (
+                <div style={{ background: '#fff', border: '1px solid var(--bdr)', borderRadius: 6, overflow: 'hidden' }}>
+                  {filtered.map((ed, i) => (
+                    <CalEditionRow
+                      key={ed.edition_id}
+                      ed={ed}
+                      disciplines={disciplines}
+                      isLast={i === filtered.length - 1}
+                      canEdit={canEdit}
+                      onEdit={() => setEditionModal({ mode: 'edit', edition: ed })}
+                      onStages={() => setStagesFor(ed)}
+                      onDelete={() => removeEdition(ed)}
+                      onStatus={(st) => quickStatus(ed, st)}
+                    />
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+
+          {/* ---------------- WEDSTRIJDEN ---------------- */}
+          {sub === 'wedstrijden' && (
+            <>
+              <div style={{ fontSize: 12, color: 'var(--grey)', marginBottom: 14 }}>
+                De tijdloze identiteit van een wedstrijd: naam en discipline. Datum, locatie en reeks horen bij de editie.
+              </div>
+              {events.length === 0 ? (
+                <div style={{ background: '#fff', border: '1px solid var(--bdr)', borderRadius: 6, padding: 30, textAlign: 'center', fontSize: 13, color: 'var(--grey)' }}>
+                  Nog geen wedstrijden.
+                </div>
+              ) : (
+                <div style={{ background: '#fff', border: '1px solid var(--bdr)', borderRadius: 6, overflow: 'hidden' }}>
+                  {events.map((ev, i) => (
+                    <div key={ev.id} style={{
+                      display: 'flex', alignItems: 'center', gap: 12, padding: '11px 14px',
+                      borderBottom: i === events.length - 1 ? 'none' : '1px solid #f0f0ee',
+                      opacity: ev.is_active ? 1 : 0.55,
+                    }}>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--blk2)' }}>{ev.name}</div>
+                        <div style={{ fontSize: 10.5, color: 'var(--grey)', fontFamily: 'monospace', marginTop: 1 }}>{ev.slug}</div>
+                      </div>
+                      <span style={{ fontSize: 11, color: 'var(--blk4)', background: '#f4f4f2', padding: '3px 8px', borderRadius: 12 }}>
+                        {disciplineLabel(ev.discipline, disciplines)}
+                      </span>
+                      {!ev.is_active && (
+                        <span style={{ fontSize: 10.5, color: 'var(--grey)', fontStyle: 'italic' }}>niet actief</span>
+                      )}
+                      {canEdit && (
+                        <div style={{ display: 'flex', gap: 6 }}>
+                          <button onClick={() => setEventModal({ mode: 'edit', event: ev })}
+                            style={calBtnStyle()}>Bewerken</button>
+                          <button onClick={async () => {
+                            if (!confirm(`Wedstrijd "${ev.name}" verwijderen? Bestaande edities blijven bestaan maar verdwijnen uit de kalender.`)) return;
+                            try { await api.cal.deleteEvent(ev.id); await reloadAll(seasonId); }
+                            catch (e) { alert('Verwijderen mislukt: ' + e.message); }
+                          }} style={calBtnStyle('danger')}>Verwijderen</button>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+
+          {/* ---------------- REEKSEN ---------------- */}
+          {sub === 'reeksen' && (
+            <>
+              <div style={{ fontSize: 12, color: 'var(--grey)', marginBottom: 14 }}>
+                Eén naam per reeks. Partners die je hier koppelt verschijnen automatisch bij elk parcours van die reeks.
+              </div>
+              {series.length === 0 ? (
+                <div style={{ background: '#fff', border: '1px solid var(--bdr)', borderRadius: 6, padding: 30, textAlign: 'center', fontSize: 13, color: 'var(--grey)' }}>
+                  Nog geen reeksen.
+                </div>
+              ) : (
+                <div style={{ background: '#fff', border: '1px solid var(--bdr)', borderRadius: 6, overflow: 'hidden' }}>
+                  {series.map((s, i) => {
+                    const parts = seriesPartners[s.slug] || [];
+                    return (
+                    <div key={s.id} style={{
+                      display: 'flex', alignItems: 'center', gap: 12, padding: '11px 14px',
+                      borderBottom: i === series.length - 1 ? 'none' : '1px solid #f0f0ee',
+                    }}>
+                      <span style={{ width: 22, height: 22, borderRadius: 5, background: s.color || '#1c1917', border: '1px solid var(--bdr)', flexShrink: 0 }} />
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--blk2)' }}>
+                          {s.name}
+                          {s.short_name && (
+                            <span style={{ marginLeft: 8, fontSize: 10, fontWeight: 700, color: 'var(--grey)', background: '#f4f4f2', padding: '2px 6px', borderRadius: 4 }}>
+                              {s.short_name}
+                            </span>
+                          )}
+                        </div>
+                        <div style={{ fontSize: 10.5, color: 'var(--grey)', fontFamily: 'monospace', marginTop: 1 }}>{s.slug}</div>
+                      </div>
+                      <span style={{ fontSize: 11, color: 'var(--blk4)', background: '#f4f4f2', padding: '3px 8px', borderRadius: 12 }}>
+                        {disciplineLabel(s.discipline, disciplines)}
+                      </span>
+                      <span style={{ fontSize: 11, color: 'var(--grey)', minWidth: 66, textAlign: 'right' }}>
+                        {parts.length} partner{parts.length !== 1 ? 's' : ''}
+                      </span>
+                      {canEdit && (
+                        <div style={{ display: 'flex', gap: 6 }}>
+                          <button onClick={() => setPartnersFor(s)} style={calBtnStyle()}>Partners</button>
+                          <button onClick={() => setSeriesModal({ mode: 'edit', series: s })}
+                            style={calBtnStyle()}>Bewerken</button>
+                          <button onClick={async () => {
+                            if (!confirm(`Reeks "${s.name}" verwijderen? Edities in deze reeks houden hun datum maar verliezen de reeks.`)) return;
+                            try { await api.cal.deleteSeries(s.id); await reloadAll(seasonId); }
+                            catch (e) { alert('Verwijderen mislukt: ' + e.message); }
+                          }} style={calBtnStyle('danger')}>Verwijderen</button>
+                        </div>
+                      )}
+                    </div>
+                    );
+                  })}
+                </div>
+              )}
+            </>
+          )}
+
+          {/* ---------------- DISCIPLINES ---------------- */}
+          {sub === 'disciplines' && (
+            <>
+              <div style={{ fontSize: 12, color: 'var(--grey)', marginBottom: 14 }}>
+                Disciplines waaruit je kiest bij een wedstrijd of reeks. De slug is de sleutel die andere apps lezen; de naam mag je vrij aanpassen.
+              </div>
+              {disciplines.length === 0 ? (
+                <div style={{ background: '#fff', border: '1px solid var(--bdr)', borderRadius: 6, padding: 30, textAlign: 'center', fontSize: 13, color: 'var(--grey)' }}>
+                  Nog geen disciplines.
+                </div>
+              ) : (
+                <div style={{ background: '#fff', border: '1px solid var(--bdr)', borderRadius: 6, overflow: 'hidden' }}>
+                  {disciplines.map((d, i) => {
+                    const inUse = events.filter(e => e.discipline === d.slug).length
+                                + series.filter(s => s.discipline === d.slug).length;
+                    return (
+                      <div key={d.id} style={{
+                        display: 'flex', alignItems: 'center', gap: 12, padding: '11px 14px',
+                        borderBottom: i === disciplines.length - 1 ? 'none' : '1px solid #f0f0ee',
+                      }}>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--blk2)' }}>{d.name}</div>
+                          <div style={{ fontSize: 10.5, color: 'var(--grey)', fontFamily: 'monospace', marginTop: 1 }}>{d.slug}</div>
+                        </div>
+                        <span style={{ fontSize: 11, color: 'var(--grey)' }}>
+                          {inUse === 0 ? 'niet in gebruik' : `${inUse}× in gebruik`}
+                        </span>
+                        {canEdit && (
+                          <div style={{ display: 'flex', gap: 6 }}>
+                            <button onClick={() => setDiscModal({ mode: 'edit', discipline: d })}
+                              style={calBtnStyle()}>Bewerken</button>
+                            <button
+                              disabled={inUse > 0}
+                              title={inUse > 0 ? 'Eerst loskoppelen van wedstrijden en reeksen' : ''}
+                              onClick={async () => {
+                                if (!confirm(`Discipline "${d.name}" verwijderen?`)) return;
+                                try { await api.cal.deleteDiscipline(d.id); await reloadAll(seasonId); }
+                                catch (e) { alert('Verwijderen mislukt: ' + e.message); }
+                              }}
+                              style={{ ...calBtnStyle('danger'), opacity: inUse > 0 ? 0.4 : 1, cursor: inUse > 0 ? 'not-allowed' : 'pointer' }}>
+                              Verwijderen
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </>
+          )}
+
+          {/* ---------------- SEIZOENEN ---------------- */}
+          {sub === 'seizoenen' && (
+            <>
+              <div style={{ fontSize: 12, color: 'var(--grey)', marginBottom: 14 }}>
+                Seizoenen van de wedstrijdendatabase. Los van de Publitool-seizoenen: die blijven voorlopig apart bestaan.
+              </div>
+              {seasons.length === 0 ? (
+                <div style={{ background: '#fff', border: '1px solid var(--bdr)', borderRadius: 6, padding: 30, textAlign: 'center', fontSize: 13, color: 'var(--grey)' }}>
+                  Nog geen seizoenen.
+                </div>
+              ) : (
+                <div style={{ background: '#fff', border: '1px solid var(--bdr)', borderRadius: 6, overflow: 'hidden' }}>
+                  {seasons.map((s, i) => {
+                    const count = s.id === seasonId ? editions.length : null;
+                    return (
+                      <div key={s.id} style={{
+                        display: 'flex', alignItems: 'center', gap: 12, padding: '11px 14px',
+                        borderBottom: i === seasons.length - 1 ? 'none' : '1px solid #f0f0ee',
+                      }}>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--blk2)' }}>
+                            {s.label}
+                            {s.is_current && (
+                              <span style={{ marginLeft: 8, fontSize: 10, fontWeight: 700, color: '#15803d', background: '#dcfce7', padding: '2px 7px', borderRadius: 10 }}>
+                                huidig
+                              </span>
+                            )}
+                          </div>
+                          <div style={{ fontSize: 10.5, color: 'var(--grey)', marginTop: 1 }}>
+                            {s.start_year} – {s.end_year}{count !== null ? ` · ${count} edities` : ''}
+                          </div>
+                        </div>
+                        {canEdit && (
+                          <div style={{ display: 'flex', gap: 6 }}>
+                            {!s.is_current && (
+                              <button onClick={async () => {
+                                try { await api.cal.setCurrentSeason(s.id); await reloadAll(s.id); }
+                                catch (e) { alert('Mislukt: ' + e.message); }
+                              }} style={calBtnStyle()}>Als huidig</button>
+                            )}
+                            <button onClick={() => setSeasonModal({ mode: 'edit', season: s })}
+                              style={calBtnStyle()}>Bewerken</button>
+                            <button onClick={async () => {
+                              if (!confirm(`Seizoen "${s.label}" verwijderen?`)) return;
+                              try { await api.cal.deleteSeason(s.id); await reloadAll(); }
+                              catch (e) { alert('Verwijderen mislukt: ' + e.message); }
+                            }} style={calBtnStyle('danger')}>Verwijderen</button>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </>
+          )}
+        </>
+      )}
+
+      {editionModal && (
+        <CalEditionModal
+          mode={editionModal.mode}
+          edition={editionModal.edition}
+          events={events}
+          series={series}
+          seasons={seasons}
+          disciplines={disciplines}
+          defaultSeasonId={seasonId}
+          onClose={() => setEditionModal(null)}
+          onDone={async (sid) => { setEditionModal(null); await reloadAll(sid || seasonId); }}
+        />
+      )}
+
+      {stagesFor && (
+        <CalStagesModal
+          edition={stagesFor}
+          canEdit={canEdit}
+          onClose={async () => { setStagesFor(null); await loadCalendar(seasonId); }}
+        />
+      )}
+
+      {eventModal && (
+        <CalEventModal
+          mode={eventModal.mode}
+          event={eventModal.event}
+          disciplines={disciplines}
+          onClose={() => setEventModal(null)}
+          onDone={async () => { setEventModal(null); await reloadAll(seasonId); }}
+        />
+      )}
+
+      {seriesModal && (
+        <CalSeriesModal
+          mode={seriesModal.mode}
+          series={seriesModal.series}
+          disciplines={disciplines}
+          onClose={() => setSeriesModal(null)}
+          onDone={async () => { setSeriesModal(null); await reloadAll(seasonId); }}
+        />
+      )}
+
+      {partnersFor && (
+        <CalSeriesPartnersModal
+          series={partnersFor}
+          allPartners={allPartners}
+          selected={(seriesPartners[partnersFor.slug] || []).map(p => p.id)}
+          onClose={() => setPartnersFor(null)}
+          onDone={async () => { setPartnersFor(null); await reloadAll(seasonId); }}
+        />
+      )}
+
+      {discModal && (
+        <CalDisciplineModal
+          mode={discModal.mode}
+          discipline={discModal.discipline}
+          onClose={() => setDiscModal(null)}
+          onDone={async () => { setDiscModal(null); await reloadAll(seasonId); }}
+        />
+      )}
+
+      {seasonModal && (
+        <CalSeasonModal
+          mode={seasonModal.mode}
+          season={seasonModal.season}
+          onClose={() => setSeasonModal(null)}
+          onDone={async () => { setSeasonModal(null); await reloadAll(seasonId); }}
+        />
+      )}
+    </>
+  );
+}
+
+// Kleine knopstijl, hergebruikt in alle kalender-lijsten
+function calBtnStyle(variant) {
+  return {
+    padding: '4px 9px', borderRadius: 4, fontSize: 11, fontWeight: 600,
+    cursor: 'pointer', fontFamily: 'inherit', whiteSpace: 'nowrap',
+    background: '#fff',
+    color: variant === 'danger' ? 'var(--red)' : 'var(--blk4)',
+    border: '1px solid ' + (variant === 'danger' ? '#f0c8c4' : 'var(--bdr)'),
+  };
+}
+
+// Gedeelde inputstijl voor de kalender-modals
+const calInput = {
+  width: '100%', padding: '7px 9px', border: '1px solid var(--bdr)',
+  borderRadius: 5, fontSize: 12.5, fontFamily: 'inherit', background: '#fff',
+  boxSizing: 'border-box',
+};
+const calLabel = {
+  display: 'block', fontSize: 11, fontWeight: 600, color: 'var(--blk4)',
+  marginBottom: 4, textTransform: 'uppercase', letterSpacing: '.03em',
+};
+
+// =================================================================
+// CalEditionRow — één rij in de kalenderlijst
+// =================================================================
+function CalEditionRow({ ed, disciplines, isLast, canEdit, onEdit, onStages, onDelete, onStatus }) {
+  const st = statusMeta(ed.status);
+  const multi = (ed.stage_count || 0) > 0;
+  const dateText = (() => {
+    if (!ed.event_date) return 'Datum onbekend';
+    if (multi && ed.end_date && ed.end_date !== ed.event_date) {
+      return `${fmtDate(ed.event_date)} – ${fmtDate(ed.end_date)}`;
+    }
+    return fmtDate(ed.event_date);
+  })();
+
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: 12, padding: '11px 14px',
+      borderBottom: isLast ? 'none' : '1px solid #f0f0ee',
+      opacity: ed.status === 'cancelled' ? 0.6 : 1,
+    }}>
+      <div style={{ width: 150, flexShrink: 0, fontSize: 12, color: 'var(--blk4)' }}>
+        {dateText}
+        {ed.start_time && <span style={{ color: 'var(--grey)' }}> · {String(ed.start_time).slice(0, 5)}</span>}
+      </div>
+
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{
+          fontSize: 13, fontWeight: 600, color: 'var(--blk2)',
+          textDecoration: ed.status === 'cancelled' ? 'line-through' : 'none',
+        }}>
+          {ed.event_name}
+          {multi && (
+            <span style={{ marginLeft: 8, fontSize: 10, fontWeight: 700, color: '#1a56a0', background: '#e0ecfa', padding: '2px 7px', borderRadius: 10 }}>
+              {ed.stage_count} {ed.stage_count === 1 ? 'rit' : 'ritten'}
+            </span>
+          )}
+        </div>
+        <div style={{ fontSize: 11, color: 'var(--grey)', marginTop: 2 }}>
+          {ed.discipline_name || disciplineLabel(ed.discipline, disciplines)}
+          {ed.series_name && <> · {ed.series_name}</>}
+          {(ed.start_location || ed.finish_location) && (
+            <> · {ed.start_location || '?'} → {ed.finish_location || '?'}</>
+          )}
+        </div>
+      </div>
+
+      {canEdit ? (
+        <select value={ed.status} onChange={e => onStatus(e.target.value)}
+          style={{
+            fontSize: 11, fontWeight: 600, padding: '3px 6px', borderRadius: 12,
+            border: '1px solid ' + st.bg, background: st.bg, color: st.color,
+            fontFamily: 'inherit', cursor: 'pointer',
+          }}>
+          {EDITION_STATUS.map(s => <option key={s.value} value={s.value}>{s.label}</option>)}
+        </select>
+      ) : (
+        <span style={{ fontSize: 11, fontWeight: 600, padding: '3px 9px', borderRadius: 12, background: st.bg, color: st.color }}>
+          {st.label}
+        </span>
+      )}
+
+      {canEdit && (
+        <div style={{ display: 'flex', gap: 6 }}>
+          <button onClick={onStages} style={calBtnStyle()}>Ritten</button>
+          <button onClick={onEdit} style={calBtnStyle()}>Bewerken</button>
+          <button onClick={onDelete} style={calBtnStyle('danger')}>Verwijderen</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// =================================================================
+// CalModalShell — gedeelde modal-omhulling voor de kalender
+// =================================================================
+function CalModalShell({ title, subtitle, onClose, onSave, saving, saveLabel = 'Opslaan', width = 460, children }) {
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 600, padding: 20 }}
+      onClick={onClose}>
+      <div onClick={e => e.stopPropagation()} style={{
+        background: '#fff', borderRadius: 8, width: '100%', maxWidth: width,
+        maxHeight: '88vh', display: 'flex', flexDirection: 'column', overflow: 'hidden',
+      }}>
+        <div style={{ padding: '16px 20px 12px', borderBottom: '1px solid #f0f0ee' }}>
+          <div style={{ fontSize: 15, fontWeight: 700, color: 'var(--blk2)' }}>{title}</div>
+          {subtitle && <div style={{ fontSize: 11.5, color: 'var(--grey)', marginTop: 3 }}>{subtitle}</div>}
+        </div>
+        <div style={{ padding: '16px 20px', overflowY: 'auto', flex: 1 }}>
+          {children}
+        </div>
+        <div style={{ padding: '12px 20px', borderTop: '1px solid #f0f0ee', display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+          <button onClick={onClose} disabled={saving}
+            style={{ padding: '7px 14px', borderRadius: 5, fontSize: 12, fontWeight: 600, cursor: 'pointer', background: '#fff', border: '1px solid var(--bdr)', color: 'var(--blk4)', fontFamily: 'inherit' }}>
+            Annuleren
+          </button>
+          {onSave && (
+            <button onClick={onSave} disabled={saving}
+              style={{ padding: '7px 14px', borderRadius: 5, fontSize: 12, fontWeight: 600, cursor: saving ? 'wait' : 'pointer', background: '#E11D48', border: '1px solid #E11D48', color: '#fff', fontFamily: 'inherit', opacity: saving ? 0.6 : 1 }}>
+              {saving ? 'Bezig...' : saveLabel}
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// =================================================================
+// CalEditionModal — editie aanmaken of bewerken
+// =================================================================
+function CalEditionModal({ mode, edition, events, series, seasons, disciplines, defaultSeasonId, onClose, onDone }) {
+  const [eventId, setEventId]   = useState(edition?.event_id || '');
+  const [seasonId, setSeasonId] = useState(edition?.season_id || defaultSeasonId || '');
+  const [seriesId, setSeriesId] = useState(edition?.series_id || '');
+  const [status, setStatus]     = useState(edition?.status || 'planned');
+  const [date, setDate]         = useState(edition?.event_date || '');
+  const [time, setTime]         = useState(edition?.start_time ? String(edition.start_time).slice(0, 5) : '');
+  const [startLoc, setStartLoc] = useState(edition?.start_location || '');
+  const [finishLoc, setFinishLoc] = useState(edition?.finish_location || '');
+  const [notes, setNotes]       = useState(edition?.notes || '');
+  const [saving, setSaving]     = useState(false);
+  const [err, setErr]           = useState(null);
+
+  const activeEvents = events.filter(e => e.is_active || e.id === eventId);
+
+  const save = async () => {
+    if (!eventId)  { setErr('Kies een wedstrijd.'); return; }
+    if (!seasonId) { setErr('Kies een seizoen.'); return; }
+    setSaving(true); setErr(null);
+    const payload = {
+      event_id: eventId,
+      season_id: seasonId,
+      series_id: seriesId || null,
+      status,
+      event_date: date || null,
+      start_time: time || null,
+      start_location: startLoc.trim() || null,
+      finish_location: finishLoc.trim() || null,
+      notes: notes.trim() || null,
+    };
+    try {
+      if (mode === 'new') await api.cal.createEdition(payload);
+      else await api.cal.updateEdition(edition.edition_id, payload);
+      onDone(seasonId);
+    } catch (e) {
+      // 23505 = unieke index (event_id, season_id)
+      const msg = /duplicate key|23505/i.test(e.message)
+        ? 'Deze wedstrijd heeft al een editie in dit seizoen.'
+        : e.message;
+      setErr(msg);
+      setSaving(false);
+    }
+  };
+
+  return (
+    <CalModalShell
+      title={mode === 'new' ? 'Nieuwe editie' : 'Editie bewerken'}
+      subtitle="Eén wedstrijd in één seizoen: datum, locaties, reeks en status."
+      onClose={onClose} onSave={save} saving={saving}>
+
+      {err && (
+        <div style={{ background: '#fee2e2', color: '#b91c1c', padding: '8px 10px', borderRadius: 5, fontSize: 11.5, marginBottom: 12 }}>
+          {err}
+        </div>
+      )}
+
+      <div style={{ marginBottom: 12 }}>
+        <label style={calLabel}>Wedstrijd</label>
+        <select value={eventId} onChange={e => setEventId(e.target.value)} style={calInput}>
+          <option value="">— kies een wedstrijd —</option>
+          {activeEvents.map(ev => (
+            <option key={ev.id} value={ev.id}>{ev.name} ({disciplineLabel(ev.discipline, disciplines)})</option>
+          ))}
+        </select>
+      </div>
+
+      <div style={{ display: 'flex', gap: 10, marginBottom: 12 }}>
+        <div style={{ flex: 1 }}>
+          <label style={calLabel}>Seizoen</label>
+          <select value={seasonId} onChange={e => setSeasonId(e.target.value)} style={calInput}>
+            {seasons.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}
+          </select>
+        </div>
+        <div style={{ flex: 1 }}>
+          <label style={calLabel}>Reeks</label>
+          <select value={seriesId} onChange={e => setSeriesId(e.target.value)} style={calInput}>
+            <option value="">Geen reeks</option>
+            {series.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+          </select>
+        </div>
+      </div>
+
+      <div style={{ display: 'flex', gap: 10, marginBottom: 12 }}>
+        <div style={{ flex: 1 }}>
+          <label style={calLabel}>Status</label>
+          <select value={status} onChange={e => setStatus(e.target.value)} style={calInput}>
+            {EDITION_STATUS.map(s => <option key={s.value} value={s.value}>{s.label}</option>)}
+          </select>
+        </div>
+        <div style={{ flex: 1 }}>
+          <label style={calLabel}>Datum</label>
+          <input type="date" value={date} onChange={e => setDate(e.target.value)} style={calInput} />
+        </div>
+        <div style={{ width: 100 }}>
+          <label style={calLabel}>Startuur</label>
+          <input type="time" value={time} onChange={e => setTime(e.target.value)} style={calInput} />
+        </div>
+      </div>
+
+      <div style={{ display: 'flex', gap: 10, marginBottom: 12 }}>
+        <div style={{ flex: 1 }}>
+          <label style={calLabel}>Startlocatie</label>
+          <input value={startLoc} onChange={e => setStartLoc(e.target.value)} placeholder="Koksijde" style={calInput} />
+        </div>
+        <div style={{ flex: 1 }}>
+          <label style={calLabel}>Finishlocatie</label>
+          <input value={finishLoc} onChange={e => setFinishLoc(e.target.value)} placeholder="Koksijde" style={calInput} />
+        </div>
+      </div>
+
+      <div>
+        <label style={calLabel}>Notities</label>
+        <textarea value={notes} onChange={e => setNotes(e.target.value)} rows={2}
+          style={{ ...calInput, resize: 'vertical' }} />
+      </div>
+
+      <div style={{ fontSize: 11, color: 'var(--grey)', marginTop: 12, lineHeight: 1.5 }}>
+        Meerdaagse wedstrijd? Zet hier de dag van rit 1 en beheer de rest via <strong>Ritten</strong> in de kalenderlijst.
+      </div>
+    </CalModalShell>
+  );
+}
+
+// =================================================================
+// CalStagesModal — ritten van een meerdaagse editie
+// =================================================================
+function CalStagesModal({ edition, canEdit, onClose }) {
+  const [stages, setStages] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState(null);
+  const [adding, setAdding] = useState(false);
+
+  const blank = { name: '', stage_date: '', start_time: '', start_location: '', finish_location: '' };
+  const [draft, setDraft] = useState(blank);
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const r = await api.cal.stages(edition.edition_id);
+      setStages(r.stages);
+    } catch (e) { setErr(e.message); }
+    finally { setLoading(false); }
+  };
+  useEffect(() => { load(); }, [edition.edition_id]);
+
+  const addStage = async () => {
+    const nextNr = stages.length === 0 ? 1 : Math.max(...stages.map(s => s.stage_number)) + 1;
+    try {
+      await api.cal.createStage({
+        edition_id: edition.edition_id,
+        stage_number: nextNr,
+        name: draft.name.trim() || `Rit ${nextNr}`,
+        stage_date: draft.stage_date || null,
+        start_time: draft.start_time || null,
+        start_location: draft.start_location.trim() || null,
+        finish_location: draft.finish_location.trim() || null,
+      });
+      setDraft(blank); setAdding(false); await load();
+    } catch (e) { alert('Rit toevoegen mislukt: ' + e.message); }
+  };
+
+  const removeStage = async (s) => {
+    if (!confirm(`${s.name || 'Rit ' + s.stage_number} verwijderen?`)) return;
+    try { await api.cal.deleteStage(s.id); await load(); }
+    catch (e) { alert('Verwijderen mislukt: ' + e.message); }
+  };
+
+  return (
+    <CalModalShell
+      title={`Ritten — ${edition.event_name}`}
+      subtitle="Enkel invullen bij meerdaagse wedstrijden. Blijft dit leeg, dan geldt de editie als ééndagswedstrijd."
+      onClose={onClose} width={620}>
+
+      {err && (
+        <div style={{ background: '#fee2e2', color: '#b91c1c', padding: '8px 10px', borderRadius: 5, fontSize: 11.5, marginBottom: 12 }}>
+          {err}
+        </div>
+      )}
+
+      {loading ? <ToolenInlineLoader text="Ritten laden..." padding={24} size="sm" /> : (
+        <>
+          {stages.length === 0 ? (
+            <div style={{ fontSize: 12.5, color: 'var(--grey)', padding: '14px 0' }}>
+              Nog geen ritten.
+            </div>
+          ) : (
+            <div style={{ border: '1px solid var(--bdr)', borderRadius: 6, overflow: 'hidden', marginBottom: 14 }}>
+              {stages.map((s, i) => (
+                <div key={s.id} style={{
+                  display: 'flex', alignItems: 'center', gap: 10, padding: '9px 12px',
+                  borderBottom: i === stages.length - 1 ? 'none' : '1px solid #f0f0ee',
+                }}>
+                  <div style={{
+                    width: 24, height: 24, borderRadius: 12, background: '#f4f4f2',
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    fontSize: 11, fontWeight: 700, color: 'var(--blk4)', flexShrink: 0,
+                  }}>
+                    {s.stage_number}
+                  </div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--blk2)' }}>
+                      {s.name || `Rit ${s.stage_number}`}
+                    </div>
+                    <div style={{ fontSize: 11, color: 'var(--grey)', marginTop: 1 }}>
+                      {s.stage_date ? fmtDate(s.stage_date) : 'geen datum'}
+                      {s.start_time && <> · {String(s.start_time).slice(0, 5)}</>}
+                      {(s.start_location || s.finish_location) && (
+                        <> · {s.start_location || '?'} → {s.finish_location || '?'}</>
+                      )}
+                    </div>
+                  </div>
+                  {canEdit && (
+                    <button onClick={() => removeStage(s)} style={calBtnStyle('danger')}>Verwijderen</button>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {canEdit && (adding ? (
+            <div style={{ border: '1px solid var(--bdr)', borderRadius: 6, padding: 12, background: '#fafafa' }}>
+              <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+                <div style={{ flex: 2 }}>
+                  <label style={calLabel}>Naam</label>
+                  <input value={draft.name} onChange={e => setDraft({ ...draft, name: e.target.value })}
+                    placeholder={`Rit ${stages.length + 1}`} style={calInput} />
+                </div>
+                <div style={{ flex: 1 }}>
+                  <label style={calLabel}>Datum</label>
+                  <input type="date" value={draft.stage_date}
+                    onChange={e => setDraft({ ...draft, stage_date: e.target.value })} style={calInput} />
+                </div>
+                <div style={{ width: 90 }}>
+                  <label style={calLabel}>Uur</label>
+                  <input type="time" value={draft.start_time}
+                    onChange={e => setDraft({ ...draft, start_time: e.target.value })} style={calInput} />
+                </div>
+              </div>
+              <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
+                <div style={{ flex: 1 }}>
+                  <label style={calLabel}>Start</label>
+                  <input value={draft.start_location}
+                    onChange={e => setDraft({ ...draft, start_location: e.target.value })} style={calInput} />
+                </div>
+                <div style={{ flex: 1 }}>
+                  <label style={calLabel}>Finish</label>
+                  <input value={draft.finish_location}
+                    onChange={e => setDraft({ ...draft, finish_location: e.target.value })} style={calInput} />
+                </div>
+              </div>
+              <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+                <button onClick={() => { setAdding(false); setDraft(blank); }} style={calBtnStyle()}>Annuleren</button>
+                <button onClick={addStage}
+                  style={{ ...calBtnStyle(), background: '#E11D48', borderColor: '#E11D48', color: '#fff' }}>
+                  Rit toevoegen
+                </button>
+              </div>
+            </div>
+          ) : (
+            <button onClick={() => setAdding(true)} style={calBtnStyle()}>+ Rit toevoegen</button>
+          ))}
+        </>
+      )}
+    </CalModalShell>
+  );
+}
+
+// =================================================================
+// CalEventModal — wedstrijd (tijdloze identiteit)
+// =================================================================
+function CalEventModal({ mode, event, disciplines, onClose, onDone }) {
+  const [name, setName]   = useState(event?.name || '');
+  const [slug, setSlug]   = useState(event?.slug || '');
+  const [slugTouched, setSlugTouched] = useState(mode === 'edit');
+  const [discipline, setDiscipline]   = useState(
+    event?.discipline || (disciplines && disciplines[0] ? disciplines[0].slug : ''));
+  const [isActive, setIsActive]       = useState(event?.is_active !== false);
+  const [notes, setNotes] = useState(event?.notes || '');
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState(null);
+
+  const onName = (v) => {
+    setName(v);
+    if (!slugTouched) setSlug(slugify(v));
+  };
+
+  const save = async () => {
+    if (!name.trim()) { setErr('Geef een naam op.'); return; }
+    const finalSlug = slug.trim() || slugify(name);
+    if (!finalSlug) { setErr('Slug kon niet bepaald worden.'); return; }
+    if (!discipline) { setErr('Maak eerst een discipline aan onder de tab Disciplines.'); return; }
+    setSaving(true); setErr(null);
+    const payload = { name: name.trim(), slug: finalSlug, discipline, is_active: isActive, notes: notes.trim() || null };
+    try {
+      if (mode === 'new') await api.cal.createEvent(payload);
+      else await api.cal.updateEvent(event.id, payload);
+      onDone();
+    } catch (e) {
+      const msg = /duplicate key|23505/i.test(e.message)
+        ? `Er bestaat al een wedstrijd met slug "${finalSlug}".`
+        : e.message;
+      setErr(msg); setSaving(false);
+    }
+  };
+
+  return (
+    <CalModalShell
+      title={mode === 'new' ? 'Nieuwe wedstrijd' : 'Wedstrijd bewerken'}
+      subtitle="Naam en discipline. Datum en locatie horen bij de editie van een seizoen."
+      onClose={onClose} onSave={save} saving={saving}>
+
+      {err && (
+        <div style={{ background: '#fee2e2', color: '#b91c1c', padding: '8px 10px', borderRadius: 5, fontSize: 11.5, marginBottom: 12 }}>
+          {err}
+        </div>
+      )}
+
+      <div style={{ marginBottom: 12 }}>
+        <label style={calLabel}>Naam</label>
+        <input value={name} onChange={e => onName(e.target.value)} placeholder="Ronde van Vlaanderen" style={calInput} autoFocus />
+      </div>
+
+      <div style={{ marginBottom: 12 }}>
+        <label style={calLabel}>Slug</label>
+        <input value={slug} onChange={e => { setSlug(slugify(e.target.value)); setSlugTouched(true); }}
+          style={{ ...calInput, fontFamily: 'monospace', fontSize: 12 }} />
+        <div style={{ fontSize: 10.5, color: 'var(--grey)', marginTop: 4 }}>
+          Vaste sleutel voor andere apps. Wijzig dit niet meer als de wedstrijd al ergens gekoppeld is.
+        </div>
+      </div>
+
+      <div style={{ marginBottom: 12 }}>
+        <label style={calLabel}>Discipline</label>
+        <select value={discipline} onChange={e => setDiscipline(e.target.value)} style={calInput}>
+          {(disciplines || []).map(d => <option key={d.slug} value={d.slug}>{d.name}</option>)}
+        </select>
+      </div>
+
+      <div style={{ marginBottom: 12 }}>
+        <label style={calLabel}>Notities</label>
+        <textarea value={notes} onChange={e => setNotes(e.target.value)} rows={2}
+          style={{ ...calInput, resize: 'vertical' }} />
+      </div>
+
+      <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12.5, color: 'var(--blk4)', cursor: 'pointer' }}>
+        <input type="checkbox" checked={isActive} onChange={e => setIsActive(e.target.checked)} />
+        Actief (verschijnt in de keuzelijst bij nieuwe edities)
+      </label>
+    </CalModalShell>
+  );
+}
+
+// =================================================================
+// CalSeriesModal — reeks
+// =================================================================
+function CalSeriesModal({ mode, series, disciplines, onClose, onDone }) {
+  const [name, setName] = useState(series?.name || '');
+  const [slug, setSlug] = useState(series?.slug || '');
+  const [slugTouched, setSlugTouched] = useState(mode === 'edit');
+  const [discipline, setDiscipline] = useState(
+    series?.discipline || (disciplines && disciplines[0] ? disciplines[0].slug : ''));
+  const [sortOrder, setSortOrder]   = useState(series?.sort_order ?? 0);
+  const [shortName, setShortName]   = useState(series?.short_name || '');
+  const [color, setColor]           = useState(series?.color || '#1c1917');
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState(null);
+
+  const save = async () => {
+    if (!name.trim()) { setErr('Geef een naam op.'); return; }
+    const finalSlug = slug.trim() || slugify(name);
+    if (!discipline) { setErr('Maak eerst een discipline aan onder de tab Disciplines.'); return; }
+    setSaving(true); setErr(null);
+    const payload = {
+      name: name.trim(), slug: finalSlug, discipline,
+      sort_order: Number(sortOrder) || 0,
+      short_name: shortName.trim() || null,
+      color,
+    };
+    try {
+      if (mode === 'new') await api.cal.createSeries(payload);
+      else await api.cal.updateSeries(series.id, payload);
+      onDone();
+    } catch (e) {
+      const msg = /duplicate key|23505/i.test(e.message)
+        ? `Er bestaat al een reeks met slug "${finalSlug}".`
+        : e.message;
+      setErr(msg); setSaving(false);
+    }
+  };
+
+  return (
+    <CalModalShell
+      title={mode === 'new' ? 'Nieuwe reeks' : 'Reeks bewerken'}
+      subtitle="Eén naam per reeks — bij een sponsorwissel pas je hem hier aan."
+      onClose={onClose} onSave={save} saving={saving} width={420}>
+
+      {err && (
+        <div style={{ background: '#fee2e2', color: '#b91c1c', padding: '8px 10px', borderRadius: 5, fontSize: 11.5, marginBottom: 12 }}>
+          {err}
+        </div>
+      )}
+
+      <div style={{ marginBottom: 12 }}>
+        <label style={calLabel}>Naam</label>
+        <input value={name} onChange={e => { setName(e.target.value); if (!slugTouched) setSlug(slugify(e.target.value)); }}
+          placeholder="Superprestige" style={calInput} autoFocus />
+      </div>
+
+      <div style={{ marginBottom: 12 }}>
+        <label style={calLabel}>Slug</label>
+        <input value={slug} onChange={e => { setSlug(slugify(e.target.value)); setSlugTouched(true); }}
+          style={{ ...calInput, fontFamily: 'monospace', fontSize: 12 }} />
+      </div>
+
+      <div style={{ display: 'flex', gap: 10, marginBottom: 12 }}>
+        <div style={{ flex: 1 }}>
+          <label style={calLabel}>Discipline</label>
+          <select value={discipline} onChange={e => setDiscipline(e.target.value)} style={calInput}>
+            {(disciplines || []).map(d => <option key={d.slug} value={d.slug}>{d.name}</option>)}
+          </select>
+        </div>
+        <div style={{ width: 110 }}>
+          <label style={calLabel}>Volgorde</label>
+          <input type="number" value={sortOrder} onChange={e => setSortOrder(e.target.value)} style={calInput} />
+        </div>
+      </div>
+
+      <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
+        <div style={{ flex: 1 }}>
+          <label style={calLabel}>Afkorting</label>
+          <input value={shortName} onChange={e => setShortName(e.target.value)}
+            placeholder="SP" maxLength={12} style={calInput} />
+        </div>
+        <div>
+          <label style={calLabel}>Kleur</label>
+          <label style={{ position: 'relative', display: 'block', width: 46, height: 34, cursor: 'pointer' }}>
+            <input type="color" value={color} onChange={e => setColor(e.target.value)}
+              style={{ position: 'absolute', inset: 0, opacity: 0, cursor: 'pointer' }} />
+            <div style={{ width: 46, height: 34, borderRadius: 5, background: color, border: '1px solid var(--bdr)' }} />
+          </label>
+        </div>
+      </div>
+      <div style={{ fontSize: 10.5, color: 'var(--grey)', marginTop: 6 }}>
+        Afkorting en kleur horen bij de reeks zelf en reizen mee naar andere apps.
+      </div>
+    </CalModalShell>
+  );
+}
+
+// =================================================================
+// CalSeriesPartnersModal — standaard-partners van een reeks
+// -----------------------------------------------------------------
+// Wie hier aangevinkt staat, verschijnt
+// automatisch bij elk parcours van deze reeks.
+// =================================================================
+function CalSeriesPartnersModal({ series, allPartners, selected, onClose, onDone }) {
+  const [ids, setIds] = useState(new Set(selected || []));
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState(null);
+  const [q, setQ] = useState('');
+
+  const toggle = (pid) => {
+    const next = new Set(ids);
+    if (next.has(pid)) next.delete(pid); else next.add(pid);
+    setIds(next);
+  };
+
+  const save = async () => {
+    setSaving(true); setErr(null);
+    try {
+      await api.cal.setSeriesPartners(series.slug, Array.from(ids));
+      onDone();
+    } catch (e) { setErr(e.message); setSaving(false); }
+  };
+
+  const filtered = (allPartners || []).filter(p =>
+    !q.trim() || p.name.toLowerCase().includes(q.trim().toLowerCase()));
+
+  return (
+    <CalModalShell
+      title={`Partners — ${series.name}`}
+      subtitle="Deze partners verschijnen automatisch bij elk parcours van deze reeks."
+      onClose={onClose} onSave={save} saving={saving} width={480}>
+
+      {err && (
+        <div style={{ background: '#fee2e2', color: '#b91c1c', padding: '8px 10px', borderRadius: 5, fontSize: 11.5, marginBottom: 12 }}>
+          {err}
+        </div>
+      )}
+
+      <input value={q} onChange={e => setQ(e.target.value)} placeholder="Zoek een partner..."
+        style={{ ...calInput, marginBottom: 10 }} />
+
+      {filtered.length === 0 ? (
+        <div style={{ fontSize: 12.5, color: 'var(--grey)', padding: '14px 0' }}>
+          {allPartners.length === 0 ? 'Nog geen reeks-partners aangemaakt.' : 'Geen partner gevonden.'}
+        </div>
+      ) : (
+        <div style={{ border: '1px solid var(--bdr)', borderRadius: 6, maxHeight: 320, overflowY: 'auto' }}>
+          {filtered.map((p, i) => (
+            <label key={p.id} style={{
+              display: 'flex', alignItems: 'center', gap: 10, padding: '8px 11px', cursor: 'pointer',
+              borderBottom: i === filtered.length - 1 ? 'none' : '1px solid #f4f4f2',
+              background: ids.has(p.id) ? '#fdf3f5' : 'transparent',
+            }}>
+              <input type="checkbox" checked={ids.has(p.id)} onChange={() => toggle(p.id)} />
+              <span style={{ width: 12, height: 12, borderRadius: 3, background: p.color || '#ccc', flexShrink: 0 }} />
+              <span style={{ fontSize: 12.5, color: 'var(--blk2)' }}>{p.name}</span>
+            </label>
+          ))}
+        </div>
+      )}
+
+      <div style={{ fontSize: 11, color: 'var(--grey)', marginTop: 10 }}>
+        {ids.size} van {allPartners.length} geselecteerd
+      </div>
+    </CalModalShell>
+  );
+}
+
+// =================================================================
+// CalDisciplineModal — discipline
+// =================================================================
+function CalDisciplineModal({ mode, discipline, onClose, onDone }) {
+  const [name, setName] = useState(discipline?.name || '');
+  const [slug, setSlug] = useState(discipline?.slug || '');
+  const [slugTouched, setSlugTouched] = useState(mode === 'edit');
+  const [sortOrder, setSortOrder] = useState(discipline?.sort_order ?? 0);
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState(null);
+
+  const save = async () => {
+    if (!name.trim()) { setErr('Geef een naam op.'); return; }
+    const finalSlug = slug.trim() || slugify(name);
+    if (!finalSlug) { setErr('Slug kon niet bepaald worden.'); return; }
+    setSaving(true); setErr(null);
+    try {
+      if (mode === 'new') {
+        await api.cal.createDiscipline({ name: name.trim(), slug: finalSlug, sort_order: Number(sortOrder) || 0 });
+      } else {
+        // Slug niet meewijzigen bij bestaande disciplines: wedstrijden en
+        // reeksen verwijzen ernaar. Naam en volgorde mogen wel.
+        await api.cal.updateDiscipline(discipline.id, { name: name.trim(), sort_order: Number(sortOrder) || 0 });
+      }
+      onDone();
+    } catch (e) {
+      const msg = /duplicate key|23505/i.test(e.message)
+        ? `Er bestaat al een discipline met slug "${finalSlug}".`
+        : e.message;
+      setErr(msg); setSaving(false);
+    }
+  };
+
+  return (
+    <CalModalShell
+      title={mode === 'new' ? 'Nieuwe discipline' : 'Discipline bewerken'}
+      onClose={onClose} onSave={save} saving={saving} width={400}>
+
+      {err && (
+        <div style={{ background: '#fee2e2', color: '#b91c1c', padding: '8px 10px', borderRadius: 5, fontSize: 11.5, marginBottom: 12 }}>
+          {err}
+        </div>
+      )}
+
+      <div style={{ marginBottom: 12 }}>
+        <label style={calLabel}>Naam</label>
+        <input value={name}
+          onChange={e => { setName(e.target.value); if (!slugTouched) setSlug(slugify(e.target.value)); }}
+          placeholder="Baanwielrennen" style={calInput} autoFocus />
+      </div>
+
+      <div style={{ marginBottom: 12 }}>
+        <label style={calLabel}>Slug</label>
+        <input value={slug} disabled={mode === 'edit'}
+          onChange={e => { setSlug(slugify(e.target.value)); setSlugTouched(true); }}
+          style={{ ...calInput, fontFamily: 'monospace', fontSize: 12, background: mode === 'edit' ? '#f4f4f2' : '#fff', color: mode === 'edit' ? 'var(--grey)' : 'inherit' }} />
+        <div style={{ fontSize: 10.5, color: 'var(--grey)', marginTop: 4 }}>
+          {mode === 'edit'
+            ? 'Ligt vast: wedstrijden en reeksen verwijzen naar deze slug. De naam mag je wel aanpassen.'
+            : 'Vaste sleutel voor andere apps. Kies hem met zorg — achteraf wijzigen kan niet.'}
+        </div>
+      </div>
+
+      <div style={{ width: 130 }}>
+        <label style={calLabel}>Volgorde</label>
+        <input type="number" value={sortOrder} onChange={e => setSortOrder(e.target.value)} style={calInput} />
+      </div>
+    </CalModalShell>
+  );
+}
+
+// =================================================================
+// CalSeasonModal — seizoen van de wedstrijdendatabase
+// =================================================================
+function CalSeasonModal({ mode, season, onClose, onDone }) {
+  const thisYear = new Date().getFullYear();
+  const [startYear, setStartYear] = useState(season?.start_year ?? thisYear);
+  const [endYear, setEndYear]     = useState(season?.end_year ?? (thisYear + 1));
+  const [label, setLabel]         = useState(season?.label || `${thisYear}-${thisYear + 1}`);
+  const [labelTouched, setLabelTouched] = useState(mode === 'edit');
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState(null);
+
+  const syncLabel = (sy, ey) => {
+    if (!labelTouched) setLabel(String(sy) === String(ey) ? String(sy) : `${sy}-${ey}`);
+  };
+
+  const save = async () => {
+    const sy = Number(startYear), ey = Number(endYear);
+    if (!label.trim()) { setErr('Geef een label op.'); return; }
+    if (!sy || !ey) { setErr('Vul beide jaartallen in.'); return; }
+    if (ey < sy) { setErr('Het eindjaar ligt voor het startjaar.'); return; }
+    setSaving(true); setErr(null);
+    try {
+      if (mode === 'new') await api.cal.createSeason({ label: label.trim(), start_year: sy, end_year: ey });
+      else await api.cal.updateSeason(season.id, { label: label.trim(), start_year: sy, end_year: ey });
+      onDone();
+    } catch (e) {
+      const msg = /duplicate key|23505/i.test(e.message)
+        ? `Er bestaat al een seizoen "${label.trim()}".`
+        : e.message;
+      setErr(msg); setSaving(false);
+    }
+  };
+
+  return (
+    <CalModalShell
+      title={mode === 'new' ? 'Nieuw seizoen' : 'Seizoen bewerken'}
+      onClose={onClose} onSave={save} saving={saving} width={400}>
+
+      {err && (
+        <div style={{ background: '#fee2e2', color: '#b91c1c', padding: '8px 10px', borderRadius: 5, fontSize: 11.5, marginBottom: 12 }}>
+          {err}
+        </div>
+      )}
+
+      <div style={{ display: 'flex', gap: 10, marginBottom: 12 }}>
+        <div style={{ flex: 1 }}>
+          <label style={calLabel}>Startjaar</label>
+          <input type="number" value={startYear}
+            onChange={e => { setStartYear(e.target.value); syncLabel(e.target.value, endYear); }}
+            style={calInput} />
+        </div>
+        <div style={{ flex: 1 }}>
+          <label style={calLabel}>Eindjaar</label>
+          <input type="number" value={endYear}
+            onChange={e => { setEndYear(e.target.value); syncLabel(startYear, e.target.value); }}
+            style={calInput} />
+        </div>
+      </div>
+
+      <div>
+        <label style={calLabel}>Label</label>
+        <input value={label} onChange={e => { setLabel(e.target.value); setLabelTouched(true); }}
+          placeholder="2026-2027" style={calInput} />
+        <div style={{ fontSize: 10.5, color: 'var(--grey)', marginTop: 4 }}>
+          Zo verschijnt het seizoen in alle apps die de kalender lezen.
+        </div>
+      </div>
+    </CalModalShell>
   );
 }
 
@@ -15707,9 +17352,9 @@ function ResetPasswordModal({ user, onClose, onDone }) {
   );
 }
 
-function DuplicateModal({ source, seasons, koepels, onClose, onDone }) {
+function DuplicateModal({ source, seasons, onClose, onDone }) {
   const [seasonId, setSeasonId] = useState(source.season_id);
-  const [koepelId, setKoepelId] = useState(source.koepel_id || '');
+
   const [location, setLocation] = useState(source.location_name);
   const [date, setDate] = useState('');
   const [copyZones, setCopyZones] = useState(false);
@@ -15724,7 +17369,8 @@ function DuplicateModal({ source, seasons, koepels, onClose, onDone }) {
       const res = await api.parcoursDuplicate({
         source_id: source.id,
         season_id: seasonId,
-        koepel_id: koepelId || null,
+        series_slug: source.series_slug || null,
+        series_name: source.series_name || null,
         location_name: location.trim(),
         race_date: date,
         copy_zones: copyZones,
@@ -15744,23 +17390,18 @@ function DuplicateModal({ source, seasons, koepels, onClose, onDone }) {
         <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 4 }}>Parcours dupliceren</div>
         <div style={{ fontSize: 12, color: 'var(--grey)', marginBottom: 16 }}>Bron: <strong>{source.location_name}</strong> ({source.season_label})</div>
         <form onSubmit={submit}>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 9, marginBottom: 11 }}>
-            <div>
-              <label style={{ display: 'block', fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: 'var(--grey)', marginBottom: 4 }}>Seizoen</label>
-              <select value={seasonId} onChange={(e) => setSeasonId(parseInt(e.target.value))}
-                style={{ width: '100%', padding: '7px 9px', border: '1px solid var(--bdr)', borderRadius: 5, fontSize: 13, fontFamily: 'inherit' }}>
-                {seasons.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}
-              </select>
-            </div>
-            <div>
-              <label style={{ display: 'block', fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: 'var(--grey)', marginBottom: 4 }}>Koepel</label>
-              <select value={koepelId} onChange={(e) => setKoepelId(e.target.value)}
-                style={{ width: '100%', padding: '7px 9px', border: '1px solid var(--bdr)', borderRadius: 5, fontSize: 13, fontFamily: 'inherit' }}>
-                <option value="">— geen koepel —</option>
-                {koepels.map(k => <option key={k.id} value={k.id}>{k.name}</option>)}
-              </select>
-            </div>
+          <div style={{ marginBottom: 11 }}>
+            <label style={{ display: 'block', fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: 'var(--grey)', marginBottom: 4 }}>Seizoen</label>
+            <select value={seasonId} onChange={(e) => setSeasonId(parseInt(e.target.value))}
+              style={{ width: '100%', padding: '7px 9px', border: '1px solid var(--bdr)', borderRadius: 5, fontSize: 13, fontFamily: 'inherit' }}>
+              {seasons.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}
+            </select>
           </div>
+          {source.series_name && (
+            <div style={{ marginBottom: 11, fontSize: 11.5, color: 'var(--grey)' }}>
+              Reeks <strong style={{ color: 'var(--blk4)' }}>{source.series_name}</strong> wordt overgenomen van het origineel.
+            </div>
+          )}
           <div style={{ marginBottom: 11 }}>
             <label style={{ display: 'block', fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: 'var(--grey)', marginBottom: 4 }}>Locatie</label>
             <input type="text" value={location} onChange={(e) => setLocation(e.target.value)} required
@@ -15918,11 +17559,11 @@ function MobileApp({ user, onLogout, view, editingParcoursId, openParcours, clos
 function MobileDashboard({ user, onLogout, onOpenParcours }) {
   const [parcoursList, setParcoursList] = useState([]);
   const [seasons, setSeasons] = useState([]);
-  const [koepels, setKoepels] = useState([]);
+  const [seriesList, setSeriesList] = useState([]);
   const [currentSeasonId, setCurrentSeasonId] = useState(null);
-  // Koepel-filter: '' = alle koepels, 'none' = parcoursen zonder koepel,
-  // anders een numerieke koepel-id (als string in de <select>).
-  const [koepelFilter, setKoepelFilter] = useState('');
+  // Reeks-filter: '' = alle reeksen, 'none' = parcoursen zonder reeks,
+  // anders een series_slug.
+  const [seriesFilter, setSeriesFilter] = useState('');
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState(null);
   
@@ -15933,14 +17574,14 @@ function MobileDashboard({ user, onLogout, onOpenParcours }) {
       // GEEN losse integer. Eerder passeerden we de seizoen-id rauw, waardoor
       // URLSearchParams er '0=...' van maakte en de server 'm negeerde —
       // resultaat: alle parcoursen werden getoond ongeacht het seizoen.
-      const [seasonsRes, koepelsRes, parcoursRes] = await Promise.all([
+      const [seasonsRes, seriesRes, parcoursRes] = await Promise.all([
         api.seasons(),
-        api.koepels(),
+        api.cal.series(),
         seasonId ? api.parcoursList({ season_id: seasonId }) : Promise.resolve({ parcours: [] }),
       ]);
       const allSeasons = seasonsRes.seasons || [];
       setSeasons(allSeasons);
-      setKoepels(koepelsRes.koepels || []);
+      setSeriesList(seriesRes.series || []);
       // Pick a default season: the one marked current, or first.
       let pickId = seasonId;
       if (!pickId) {
@@ -15967,23 +17608,23 @@ function MobileDashboard({ user, onLogout, onOpenParcours }) {
     catch (_) { return d; }
   };
   
-  // Filter eerst op koepel — '' = geen filter, 'none' = parcoursen zonder koepel,
-  // anders match op koepel_id.
+  // Filter eerst op reeks — '' = geen filter, 'none' = parcoursen zonder reeks,
+  // anders match op series_slug.
   const filteredList = parcoursList.filter(p => {
-    if (koepelFilter === '') return true;
-    if (koepelFilter === 'none') return p.koepel_id == null;
-    return String(p.koepel_id) === String(koepelFilter);
+    if (seriesFilter === '') return true;
+    if (seriesFilter === 'none') return !p.series_slug;
+    return p.series_slug === seriesFilter;
   });
   // Sort: upcoming first (chronological), then past (reverse chronological)
   const today = new Date().toISOString().slice(0, 10);
   const upcoming = filteredList.filter(p => p.race_date >= today).sort((a, b) => a.race_date.localeCompare(b.race_date));
   const past = filteredList.filter(p => p.race_date < today).sort((a, b) => b.race_date.localeCompare(a.race_date));
   const sorted = [...upcoming, ...past];
-  // Alleen koepels tonen in de dropdown die effectief voorkomen in dit seizoen,
+  // Alleen reeksen tonen in de dropdown die effectief voorkomen in dit seizoen,
   // zodat we geen lege filter-opties opdienen.
-  const koepelIdsInSeason = new Set(parcoursList.map(p => p.koepel_id).filter(id => id != null).map(String));
-  const koepelsInSeason = koepels.filter(k => koepelIdsInSeason.has(String(k.id)));
-  const hasUnassigned = parcoursList.some(p => p.koepel_id == null);
+  const slugsInSeason = new Set(parcoursList.map(p => p.series_slug).filter(Boolean));
+  const seriesInSeason = seriesList.filter(k => slugsInSeason.has(k.slug));
+  const hasUnassigned = parcoursList.some(p => !p.series_slug);
   
   return (
     <div style={{ minHeight: '100vh', background: '#f6f6f6', fontFamily: "'IBM Plex Sans', sans-serif", color: '#1d1d1b', paddingBottom: 32 }}>
@@ -16002,7 +17643,7 @@ function MobileDashboard({ user, onLogout, onOpenParcours }) {
           <div style={{ marginBottom: 8 }}>
             <select
               value={currentSeasonId || ''}
-              onChange={(e) => { const id = parseInt(e.target.value); setCurrentSeasonId(id); setKoepelFilter(''); loadAll(id); }}
+              onChange={(e) => { const id = parseInt(e.target.value); setCurrentSeasonId(id); setSeriesFilter(''); loadAll(id); }}
               style={{ width: '100%', padding: '10px 12px', border: '1px solid #ddd', borderRadius: 6, fontSize: 14, fontFamily: 'inherit', background: '#fff', cursor: 'pointer' }}
             >
               {seasons.map(s => (
@@ -16012,19 +17653,19 @@ function MobileDashboard({ user, onLogout, onOpenParcours }) {
           </div>
         )}
         
-        {/* Koepel-filter — alleen tonen als er minstens 2 keuzes zijn (anders heeft 'm geen zin) */}
-        {(koepelsInSeason.length + (hasUnassigned ? 1 : 0)) > 1 && (
+        {/* Reeks-filter — alleen tonen als er minstens 2 keuzes zijn (anders heeft 'm geen zin) */}
+        {(seriesInSeason.length + (hasUnassigned ? 1 : 0)) > 1 && (
           <div style={{ marginBottom: 14 }}>
             <select
-              value={koepelFilter}
-              onChange={(e) => setKoepelFilter(e.target.value)}
+              value={seriesFilter}
+              onChange={(e) => setSeriesFilter(e.target.value)}
               style={{ width: '100%', padding: '10px 12px', border: '1px solid #ddd', borderRadius: 6, fontSize: 14, fontFamily: 'inherit', background: '#fff', cursor: 'pointer' }}
             >
-              <option value="">Alle koepels</option>
-              {koepelsInSeason.map(k => (
+              <option value="">Alle reeksen</option>
+              {seriesInSeason.map(k => (
                 <option key={k.id} value={k.id}>{k.name}</option>
               ))}
-              {hasUnassigned && <option value="none">— Zonder koepel —</option>}
+              {hasUnassigned && <option value="none">— Zonder reeks —</option>}
             </select>
           </div>
         )}
@@ -16050,9 +17691,9 @@ function MobileDashboard({ user, onLogout, onOpenParcours }) {
                     display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10,
                   }}>
                   <div style={{ flex: 1, minWidth: 0 }}>
-                    {p.koepel_name && (
+                    {p.series_name && (
                       <div style={{ fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: '#D85060', marginBottom: 2 }}>
-                        {p.koepel_name}
+                        {p.series_name}
                       </div>
                     )}
                     <div style={{ fontSize: 16, fontWeight: 700, color: '#1d1d1b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.location_name}</div>
@@ -16110,7 +17751,7 @@ function MobileViewer({ parcoursId, onBack }) {
         location_name: p.location_name,
         race_date: p.race_date,
         season_label: p.season_label,
-        koepel_name: p.koepel_name,
+        series_name: p.series_name,
         bg_image_path: p.bg_image_path,
         bg_width: p.bg_width,
         bg_height: p.bg_height,
@@ -16424,7 +18065,6 @@ function MobileLedsList({ editorApi, partners, onClose }) {
 // Welke rol mag wat? Server is leidend, dit is alleen UI-filter.
 const RoleCan = {
   manageUsers:    (role) => role === 'admin',
-  manageKoepels:  (role) => role === 'admin',
   manageSeasons:  (role) => role === 'admin',
   managePartners: (role) => role === 'admin' || role === 'editor',
   manageProfiles: (role) => role === 'admin' || role === 'editor',
@@ -16500,7 +18140,7 @@ function App() {
   
   // ============ ROUTING ============
   // URL-formaat: hash-based zodat we geen server-config nodig hebben.
-  //  - Dashboard:        #dashboard/{tab}    (tabs: events|partners|koepels|profiles|users)
+  //  - Dashboard:        #dashboard/{tab}    (tabs: events|wedstrijden|partners|profiles|users)
   //  - Editor:           #parcours/{id}
   //  - Geen hash:        Dashboard + default tab (events)
   //
@@ -16517,7 +18157,7 @@ function App() {
       const hash = window.location.hash;
       const mEditor = hash.match(/^#parcours\/(.+)$/);
       if (mEditor) return { view: 'editor', parcoursId: mEditor[1], dashboardTab: 'parcours' };
-      const mDash = hash.match(/^#dashboard\/(events|partners|koepels|profiles|users)$/);
+      const mDash = hash.match(/^#dashboard\/(events|wedstrijden|partners|profiles|users)$/);
       if (mDash) {
         // 'events' in URL = 'parcours' in interne state (legacy naming)
         const tab = mDash[1] === 'events' ? 'parcours' : mDash[1];
@@ -16593,7 +18233,7 @@ function App() {
           setView('editor');
           return;
         }
-        const mDash = hash.match(/^#dashboard\/(events|partners|koepels|profiles|users)$/);
+        const mDash = hash.match(/^#dashboard\/(events|wedstrijden|partners|profiles|users)$/);
         if (mDash) {
           const tab = mDash[1] === 'events' ? 'parcours' : mDash[1];
           setView('dashboard');
