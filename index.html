@@ -822,6 +822,29 @@ const api = {
   // nooit met publitool_*. Bij de verhuizing wissel je hier de client om
   // (een tweede createClient naar het andere project) en verder niets.
   cal: {
+    // ----- disciplines -----
+    disciplines: async () => {
+      const rows = chk(await sb.from('flcs_disciplines')
+        .select('*').is('deleted_at', null)
+        .order('sort_order').order('name'));
+      return { disciplines: rows || [] };
+    },
+    createDiscipline: async (data) => {
+      const row = chk(await sb.from('flcs_disciplines').insert({
+        slug: data.slug, name: data.name, sort_order: data.sort_order ?? 0,
+      }).select().single());
+      return { discipline: row };
+    },
+    updateDiscipline: async (id, fields) => {
+      chk(await sb.from('flcs_disciplines').update(fields).eq('id', id));
+      return { ok: true };
+    },
+    deleteDiscipline: async (id) => {
+      chk(await sb.from('flcs_disciplines')
+        .update({ deleted_at: new Date().toISOString() }).eq('id', id));
+      return { ok: true };
+    },
+
     // ----- seizoenen -----
     seasons: async () => {
       const rows = chk(await sb.from('flcs_seasons')
@@ -971,13 +994,15 @@ const api = {
 // =================================================================
 // Kalender-helpers
 // =================================================================
-const DISCIPLINES = [
-  { value: 'veldrijden', label: 'Veldrijden' },
-  { value: 'weg',        label: 'Weg' },
-  { value: 'mtb',        label: 'MTB' },
-  { value: 'gravel',     label: 'Gravel' },
-  { value: 'piste',      label: 'Piste' },
-  { value: 'andere',     label: 'Andere' },
+// Fallback zolang de disciplines uit de database nog niet geladen zijn.
+// De echte lijst komt uit flcs_disciplines (zie api.cal.disciplines).
+const DISCIPLINES_FALLBACK = [
+  { slug: 'veldrijden', name: 'Veldrijden' },
+  { slug: 'weg',        name: 'Weg' },
+  { slug: 'mtb',        name: 'MTB' },
+  { slug: 'gravel',     name: 'Gravel' },
+  { slug: 'piste',      name: 'Piste' },
+  { slug: 'andere',     name: 'Andere' },
 ];
 
 const EDITION_STATUS = [
@@ -986,9 +1011,13 @@ const EDITION_STATUS = [
   { value: 'cancelled', label: 'Gaat niet door', color: '#b91c1c', bg: '#fee2e2' },
 ];
 
-function disciplineLabel(v) {
-  const d = DISCIPLINES.find(x => x.value === v);
-  return d ? d.label : (v || '—');
+// Slug -> leesbare naam. Onbekende slugs tonen we gewoon zoals ze zijn,
+// zodat een verwijderde discipline geen lege cel oplevert.
+function disciplineLabel(slug, list) {
+  if (!slug) return '—';
+  const src = (list && list.length) ? list : DISCIPLINES_FALLBACK;
+  const d = src.find(x => x.slug === slug);
+  return d ? d.name : slug;
 }
 
 function statusMeta(v) {
@@ -15548,6 +15577,7 @@ function WedstrijdenTab({ user }) {
   const [seasons, setSeasons] = useState([]);
   const [series, setSeries]   = useState([]);
   const [events, setEvents]   = useState([]);
+  const [disciplines, setDisciplines] = useState([]);
   const [editions, setEditions] = useState([]);
   const [seasonId, setSeasonId] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -15564,14 +15594,18 @@ function WedstrijdenTab({ user }) {
   const [eventModal, setEventModal]     = useState(null);
   const [seriesModal, setSeriesModal]   = useState(null);
   const [seasonModal, setSeasonModal]   = useState(null);
+  const [discModal, setDiscModal]       = useState(null);
 
   const canEdit = user?.role === 'admin' || user?.role === 'editor';
 
   const loadBase = async (keepSeasonId = null) => {
-    const [s, sr, ev] = await Promise.all([api.cal.seasons(), api.cal.series(), api.cal.events()]);
+    const [s, sr, ev, di] = await Promise.all([
+      api.cal.seasons(), api.cal.series(), api.cal.events(), api.cal.disciplines(),
+    ]);
     setSeasons(s.seasons);
     setSeries(sr.series);
     setEvents(ev.events);
+    setDisciplines(di.disciplines);
     let sid = keepSeasonId || seasonId;
     if (!sid || !s.seasons.some(x => x.id === sid)) {
       const cur = s.seasons.find(x => x.is_current);
@@ -15630,6 +15664,7 @@ function WedstrijdenTab({ user }) {
     { id: 'kalender',    label: 'Kalender' },
     { id: 'wedstrijden', label: 'Wedstrijden' },
     { id: 'reeksen',     label: 'Reeksen' },
+    { id: 'disciplines', label: 'Disciplines' },
     { id: 'seizoenen',   label: 'Seizoenen' },
   ];
 
@@ -15667,6 +15702,12 @@ function WedstrijdenTab({ user }) {
             + Reeks
           </button>
         )}
+        {canEdit && sub === 'disciplines' && (
+          <button onClick={() => setDiscModal({ mode: 'new' })}
+            style={{ background: '#E11D48', color: '#fff', border: '1px solid #E11D48', padding: '6px 12px', borderRadius: 5, fontSize: 12, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap' }}>
+            + Discipline
+          </button>
+        )}
         {canEdit && sub === 'seizoenen' && (
           <button onClick={() => setSeasonModal({ mode: 'new' })}
             style={{ background: '#E11D48', color: '#fff', border: '1px solid #E11D48', padding: '6px 12px', borderRadius: 5, fontSize: 12, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap' }}>
@@ -15702,7 +15743,7 @@ function WedstrijdenTab({ user }) {
                 <select value={fDiscipline} onChange={e => setFDiscipline(e.target.value)}
                   style={{ padding: '6px 9px', border: '1px solid var(--bdr)', borderRadius: 5, fontSize: 12, fontFamily: 'inherit', background: '#fff' }}>
                   <option value="">Alle disciplines</option>
-                  {DISCIPLINES.map(d => <option key={d.value} value={d.value}>{d.label}</option>)}
+                  {disciplines.map(d => <option key={d.slug} value={d.slug}>{d.name}</option>)}
                 </select>
 
                 <select value={fSeries} onChange={e => setFSeries(e.target.value)}
@@ -15737,6 +15778,7 @@ function WedstrijdenTab({ user }) {
                     <CalEditionRow
                       key={ed.edition_id}
                       ed={ed}
+                      disciplines={disciplines}
                       isLast={i === filtered.length - 1}
                       canEdit={canEdit}
                       onEdit={() => setEditionModal({ mode: 'edit', edition: ed })}
@@ -15773,7 +15815,7 @@ function WedstrijdenTab({ user }) {
                         <div style={{ fontSize: 10.5, color: 'var(--grey)', fontFamily: 'monospace', marginTop: 1 }}>{ev.slug}</div>
                       </div>
                       <span style={{ fontSize: 11, color: 'var(--blk4)', background: '#f4f4f2', padding: '3px 8px', borderRadius: 12 }}>
-                        {disciplineLabel(ev.discipline)}
+                        {disciplineLabel(ev.discipline, disciplines)}
                       </span>
                       {!ev.is_active && (
                         <span style={{ fontSize: 10.5, color: 'var(--grey)', fontStyle: 'italic' }}>niet actief</span>
@@ -15818,7 +15860,7 @@ function WedstrijdenTab({ user }) {
                         <div style={{ fontSize: 10.5, color: 'var(--grey)', fontFamily: 'monospace', marginTop: 1 }}>{s.slug}</div>
                       </div>
                       <span style={{ fontSize: 11, color: 'var(--blk4)', background: '#f4f4f2', padding: '3px 8px', borderRadius: 12 }}>
-                        {disciplineLabel(s.discipline)}
+                        {disciplineLabel(s.discipline, disciplines)}
                       </span>
                       {canEdit && (
                         <div style={{ display: 'flex', gap: 6 }}>
@@ -15833,6 +15875,58 @@ function WedstrijdenTab({ user }) {
                       )}
                     </div>
                   ))}
+                </div>
+              )}
+            </>
+          )}
+
+          {/* ---------------- DISCIPLINES ---------------- */}
+          {sub === 'disciplines' && (
+            <>
+              <div style={{ fontSize: 12, color: 'var(--grey)', marginBottom: 14 }}>
+                Disciplines waaruit je kiest bij een wedstrijd of reeks. De slug is de sleutel die andere apps lezen; de naam mag je vrij aanpassen.
+              </div>
+              {disciplines.length === 0 ? (
+                <div style={{ background: '#fff', border: '1px solid var(--bdr)', borderRadius: 6, padding: 30, textAlign: 'center', fontSize: 13, color: 'var(--grey)' }}>
+                  Nog geen disciplines.
+                </div>
+              ) : (
+                <div style={{ background: '#fff', border: '1px solid var(--bdr)', borderRadius: 6, overflow: 'hidden' }}>
+                  {disciplines.map((d, i) => {
+                    const inUse = events.filter(e => e.discipline === d.slug).length
+                                + series.filter(s => s.discipline === d.slug).length;
+                    return (
+                      <div key={d.id} style={{
+                        display: 'flex', alignItems: 'center', gap: 12, padding: '11px 14px',
+                        borderBottom: i === disciplines.length - 1 ? 'none' : '1px solid #f0f0ee',
+                      }}>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--blk2)' }}>{d.name}</div>
+                          <div style={{ fontSize: 10.5, color: 'var(--grey)', fontFamily: 'monospace', marginTop: 1 }}>{d.slug}</div>
+                        </div>
+                        <span style={{ fontSize: 11, color: 'var(--grey)' }}>
+                          {inUse === 0 ? 'niet in gebruik' : `${inUse}× in gebruik`}
+                        </span>
+                        {canEdit && (
+                          <div style={{ display: 'flex', gap: 6 }}>
+                            <button onClick={() => setDiscModal({ mode: 'edit', discipline: d })}
+                              style={calBtnStyle()}>Bewerken</button>
+                            <button
+                              disabled={inUse > 0}
+                              title={inUse > 0 ? 'Eerst loskoppelen van wedstrijden en reeksen' : ''}
+                              onClick={async () => {
+                                if (!confirm(`Discipline "${d.name}" verwijderen?`)) return;
+                                try { await api.cal.deleteDiscipline(d.id); await reloadAll(seasonId); }
+                                catch (e) { alert('Verwijderen mislukt: ' + e.message); }
+                              }}
+                              style={{ ...calBtnStyle('danger'), opacity: inUse > 0 ? 0.4 : 1, cursor: inUse > 0 ? 'not-allowed' : 'pointer' }}>
+                              Verwijderen
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               )}
             </>
@@ -15904,6 +15998,7 @@ function WedstrijdenTab({ user }) {
           events={events}
           series={series}
           seasons={seasons}
+          disciplines={disciplines}
           defaultSeasonId={seasonId}
           onClose={() => setEditionModal(null)}
           onDone={async (sid) => { setEditionModal(null); await reloadAll(sid || seasonId); }}
@@ -15922,6 +16017,7 @@ function WedstrijdenTab({ user }) {
         <CalEventModal
           mode={eventModal.mode}
           event={eventModal.event}
+          disciplines={disciplines}
           onClose={() => setEventModal(null)}
           onDone={async () => { setEventModal(null); await reloadAll(seasonId); }}
         />
@@ -15931,8 +16027,18 @@ function WedstrijdenTab({ user }) {
         <CalSeriesModal
           mode={seriesModal.mode}
           series={seriesModal.series}
+          disciplines={disciplines}
           onClose={() => setSeriesModal(null)}
           onDone={async () => { setSeriesModal(null); await reloadAll(seasonId); }}
+        />
+      )}
+
+      {discModal && (
+        <CalDisciplineModal
+          mode={discModal.mode}
+          discipline={discModal.discipline}
+          onClose={() => setDiscModal(null)}
+          onDone={async () => { setDiscModal(null); await reloadAll(seasonId); }}
         />
       )}
 
@@ -15973,7 +16079,7 @@ const calLabel = {
 // =================================================================
 // CalEditionRow — één rij in de kalenderlijst
 // =================================================================
-function CalEditionRow({ ed, isLast, canEdit, onEdit, onStages, onDelete, onStatus }) {
+function CalEditionRow({ ed, disciplines, isLast, canEdit, onEdit, onStages, onDelete, onStatus }) {
   const st = statusMeta(ed.status);
   const multi = (ed.stage_count || 0) > 0;
   const dateText = (() => {
@@ -16008,7 +16114,7 @@ function CalEditionRow({ ed, isLast, canEdit, onEdit, onStages, onDelete, onStat
           )}
         </div>
         <div style={{ fontSize: 11, color: 'var(--grey)', marginTop: 2 }}>
-          {disciplineLabel(ed.discipline)}
+          {ed.discipline_name || disciplineLabel(ed.discipline, disciplines)}
           {ed.series_name && <> · {ed.series_name}</>}
           {(ed.start_location || ed.finish_location) && (
             <> · {ed.start_location || '?'} → {ed.finish_location || '?'}</>
@@ -16080,7 +16186,7 @@ function CalModalShell({ title, subtitle, onClose, onSave, saving, saveLabel = '
 // =================================================================
 // CalEditionModal — editie aanmaken of bewerken
 // =================================================================
-function CalEditionModal({ mode, edition, events, series, seasons, defaultSeasonId, onClose, onDone }) {
+function CalEditionModal({ mode, edition, events, series, seasons, disciplines, defaultSeasonId, onClose, onDone }) {
   const [eventId, setEventId]   = useState(edition?.event_id || '');
   const [seasonId, setSeasonId] = useState(edition?.season_id || defaultSeasonId || '');
   const [seriesId, setSeriesId] = useState(edition?.series_id || '');
@@ -16141,7 +16247,7 @@ function CalEditionModal({ mode, edition, events, series, seasons, defaultSeason
         <select value={eventId} onChange={e => setEventId(e.target.value)} style={calInput}>
           <option value="">— kies een wedstrijd —</option>
           {activeEvents.map(ev => (
-            <option key={ev.id} value={ev.id}>{ev.name} ({disciplineLabel(ev.discipline)})</option>
+            <option key={ev.id} value={ev.id}>{ev.name} ({disciplineLabel(ev.discipline, disciplines)})</option>
           ))}
         </select>
       </div>
@@ -16350,11 +16456,12 @@ function CalStagesModal({ edition, canEdit, onClose }) {
 // =================================================================
 // CalEventModal — wedstrijd (tijdloze identiteit)
 // =================================================================
-function CalEventModal({ mode, event, onClose, onDone }) {
+function CalEventModal({ mode, event, disciplines, onClose, onDone }) {
   const [name, setName]   = useState(event?.name || '');
   const [slug, setSlug]   = useState(event?.slug || '');
   const [slugTouched, setSlugTouched] = useState(mode === 'edit');
-  const [discipline, setDiscipline]   = useState(event?.discipline || 'veldrijden');
+  const [discipline, setDiscipline]   = useState(
+    event?.discipline || (disciplines && disciplines[0] ? disciplines[0].slug : ''));
   const [isActive, setIsActive]       = useState(event?.is_active !== false);
   const [notes, setNotes] = useState(event?.notes || '');
   const [saving, setSaving] = useState(false);
@@ -16369,6 +16476,7 @@ function CalEventModal({ mode, event, onClose, onDone }) {
     if (!name.trim()) { setErr('Geef een naam op.'); return; }
     const finalSlug = slug.trim() || slugify(name);
     if (!finalSlug) { setErr('Slug kon niet bepaald worden.'); return; }
+    if (!discipline) { setErr('Maak eerst een discipline aan onder de tab Disciplines.'); return; }
     setSaving(true); setErr(null);
     const payload = { name: name.trim(), slug: finalSlug, discipline, is_active: isActive, notes: notes.trim() || null };
     try {
@@ -16412,7 +16520,7 @@ function CalEventModal({ mode, event, onClose, onDone }) {
       <div style={{ marginBottom: 12 }}>
         <label style={calLabel}>Discipline</label>
         <select value={discipline} onChange={e => setDiscipline(e.target.value)} style={calInput}>
-          {DISCIPLINES.map(d => <option key={d.value} value={d.value}>{d.label}</option>)}
+          {(disciplines || []).map(d => <option key={d.slug} value={d.slug}>{d.name}</option>)}
         </select>
       </div>
 
@@ -16433,11 +16541,12 @@ function CalEventModal({ mode, event, onClose, onDone }) {
 // =================================================================
 // CalSeriesModal — reeks
 // =================================================================
-function CalSeriesModal({ mode, series, onClose, onDone }) {
+function CalSeriesModal({ mode, series, disciplines, onClose, onDone }) {
   const [name, setName] = useState(series?.name || '');
   const [slug, setSlug] = useState(series?.slug || '');
   const [slugTouched, setSlugTouched] = useState(mode === 'edit');
-  const [discipline, setDiscipline] = useState(series?.discipline || 'veldrijden');
+  const [discipline, setDiscipline] = useState(
+    series?.discipline || (disciplines && disciplines[0] ? disciplines[0].slug : ''));
   const [sortOrder, setSortOrder]   = useState(series?.sort_order ?? 0);
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState(null);
@@ -16445,6 +16554,7 @@ function CalSeriesModal({ mode, series, onClose, onDone }) {
   const save = async () => {
     if (!name.trim()) { setErr('Geef een naam op.'); return; }
     const finalSlug = slug.trim() || slugify(name);
+    if (!discipline) { setErr('Maak eerst een discipline aan onder de tab Disciplines.'); return; }
     setSaving(true); setErr(null);
     const payload = { name: name.trim(), slug: finalSlug, discipline, sort_order: Number(sortOrder) || 0 };
     try {
@@ -16487,13 +16597,84 @@ function CalSeriesModal({ mode, series, onClose, onDone }) {
         <div style={{ flex: 1 }}>
           <label style={calLabel}>Discipline</label>
           <select value={discipline} onChange={e => setDiscipline(e.target.value)} style={calInput}>
-            {DISCIPLINES.map(d => <option key={d.value} value={d.value}>{d.label}</option>)}
+            {(disciplines || []).map(d => <option key={d.slug} value={d.slug}>{d.name}</option>)}
           </select>
         </div>
         <div style={{ width: 110 }}>
           <label style={calLabel}>Volgorde</label>
           <input type="number" value={sortOrder} onChange={e => setSortOrder(e.target.value)} style={calInput} />
         </div>
+      </div>
+    </CalModalShell>
+  );
+}
+
+// =================================================================
+// CalDisciplineModal — discipline
+// =================================================================
+function CalDisciplineModal({ mode, discipline, onClose, onDone }) {
+  const [name, setName] = useState(discipline?.name || '');
+  const [slug, setSlug] = useState(discipline?.slug || '');
+  const [slugTouched, setSlugTouched] = useState(mode === 'edit');
+  const [sortOrder, setSortOrder] = useState(discipline?.sort_order ?? 0);
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState(null);
+
+  const save = async () => {
+    if (!name.trim()) { setErr('Geef een naam op.'); return; }
+    const finalSlug = slug.trim() || slugify(name);
+    if (!finalSlug) { setErr('Slug kon niet bepaald worden.'); return; }
+    setSaving(true); setErr(null);
+    try {
+      if (mode === 'new') {
+        await api.cal.createDiscipline({ name: name.trim(), slug: finalSlug, sort_order: Number(sortOrder) || 0 });
+      } else {
+        // Slug niet meewijzigen bij bestaande disciplines: wedstrijden en
+        // reeksen verwijzen ernaar. Naam en volgorde mogen wel.
+        await api.cal.updateDiscipline(discipline.id, { name: name.trim(), sort_order: Number(sortOrder) || 0 });
+      }
+      onDone();
+    } catch (e) {
+      const msg = /duplicate key|23505/i.test(e.message)
+        ? `Er bestaat al een discipline met slug "${finalSlug}".`
+        : e.message;
+      setErr(msg); setSaving(false);
+    }
+  };
+
+  return (
+    <CalModalShell
+      title={mode === 'new' ? 'Nieuwe discipline' : 'Discipline bewerken'}
+      onClose={onClose} onSave={save} saving={saving} width={400}>
+
+      {err && (
+        <div style={{ background: '#fee2e2', color: '#b91c1c', padding: '8px 10px', borderRadius: 5, fontSize: 11.5, marginBottom: 12 }}>
+          {err}
+        </div>
+      )}
+
+      <div style={{ marginBottom: 12 }}>
+        <label style={calLabel}>Naam</label>
+        <input value={name}
+          onChange={e => { setName(e.target.value); if (!slugTouched) setSlug(slugify(e.target.value)); }}
+          placeholder="Baanwielrennen" style={calInput} autoFocus />
+      </div>
+
+      <div style={{ marginBottom: 12 }}>
+        <label style={calLabel}>Slug</label>
+        <input value={slug} disabled={mode === 'edit'}
+          onChange={e => { setSlug(slugify(e.target.value)); setSlugTouched(true); }}
+          style={{ ...calInput, fontFamily: 'monospace', fontSize: 12, background: mode === 'edit' ? '#f4f4f2' : '#fff', color: mode === 'edit' ? 'var(--grey)' : 'inherit' }} />
+        <div style={{ fontSize: 10.5, color: 'var(--grey)', marginTop: 4 }}>
+          {mode === 'edit'
+            ? 'Ligt vast: wedstrijden en reeksen verwijzen naar deze slug. De naam mag je wel aanpassen.'
+            : 'Vaste sleutel voor andere apps. Kies hem met zorg — achteraf wijzigen kan niet.'}
+        </div>
+      </div>
+
+      <div style={{ width: 130 }}>
+        <label style={calLabel}>Volgorde</label>
+        <input type="number" value={sortOrder} onChange={e => setSortOrder(e.target.value)} style={calInput} />
       </div>
     </CalModalShell>
   );
