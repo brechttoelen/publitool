@@ -14829,10 +14829,6 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
 function EditionPicker({ value, onPick, compact = false, required = false }) {
   const [seasons, setSeasons] = useState([]);
   const [disciplines, setDisciplines] = useState([]);
-  // Partners per reeks (lokaal) + de volledige partnerlijst voor de picker
-  const [seriesPartners, setSeriesPartners] = useState({});
-  const [allPartners, setAllPartners] = useState([]);
-  const [partnersFor, setPartnersFor] = useState(null); // reeks waarvan partners bewerkt worden
   const [editions, setEditions] = useState([]);
   const [seasonId, setSeasonId] = useState('');
   const [discipline, setDiscipline] = useState('');
@@ -15883,6 +15879,10 @@ function WedstrijdenTab({ user }) {
   const [series, setSeries]   = useState([]);
   const [events, setEvents]   = useState([]);
   const [disciplines, setDisciplines] = useState([]);
+  // Partners per reeks (lokaal) + de volledige partnerlijst voor de picker
+  const [seriesPartners, setSeriesPartners] = useState({});
+  const [allPartners, setAllPartners] = useState([]);
+  const [partnersFor, setPartnersFor] = useState(null); // reeks waarvan partners bewerkt worden
   const [editions, setEditions] = useState([]);
   const [seasonId, setSeasonId] = useState(null);
   const [loading, setLoading] = useState(true);
