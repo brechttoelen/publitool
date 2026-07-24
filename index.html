@@ -14363,6 +14363,8 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
   
   const createParcours = async (e) => {
     e.preventDefault();
+    // Een event komt altijd uit de wedstrijdendatabase — geen vrije invoer.
+    if (!newEdition) return;
     if (!currentSeasonId || !newLocation || !newDate) return;
     try {
       // Het parcours hangt aan een Publitool-seizoen, de editie aan een
@@ -14681,6 +14683,7 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
             </div>
             <form onSubmit={createParcours}>
               <EditionPicker
+                required
                 value={newEdition ? newEdition.edition_id : null}
                 onPick={(row) => {
                   setNewEdition(row);
@@ -14701,15 +14704,22 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
                   {koepels.map(k => <option key={k.id} value={k.id}>{k.name}</option>)}
                 </select>
               </div>
-              <div style={{ marginBottom: 11 }}>
-                <label style={{ display: 'block', fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: 'var(--grey)', marginBottom: 4 }}>Locatie</label>
-                <input type="text" value={newLocation} onChange={(e) => setNewLocation(e.target.value)} required autoFocus placeholder="bv. Tabor, Koksijde..."
-                  style={{ width: '100%', padding: '7px 9px', border: '1px solid var(--bdr)', borderRadius: 5, fontSize: 13, fontFamily: 'inherit' }} />
-              </div>
-              <div style={{ marginBottom: 16 }}>
-                <label style={{ display: 'block', fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: 'var(--grey)', marginBottom: 4 }}>Wedstrijddatum</label>
-                <input type="date" value={newDate} onChange={(e) => setNewDate(e.target.value)} required
-                  style={{ width: '100%', padding: '7px 9px', border: '1px solid var(--bdr)', borderRadius: 5, fontSize: 13, fontFamily: 'inherit' }} />
+              {/* Locatie en datum komen uit de gekozen wedstrijd — niet los invulbaar. */}
+              <div style={{ marginBottom: 16, padding: '10px 12px', background: '#fafafa', border: '1px solid #f0f0ee', borderRadius: 6 }}>
+                <div style={{ display: 'flex', gap: 20 }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: 'var(--grey)', marginBottom: 3 }}>Locatie</div>
+                    <div style={{ fontSize: 13, color: newLocation ? 'var(--blk2)' : 'var(--lgrey)', fontWeight: newLocation ? 600 : 400 }}>
+                      {newLocation || '—'}
+                    </div>
+                  </div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: 'var(--grey)', marginBottom: 3 }}>Wedstrijddatum</div>
+                    <div style={{ fontSize: 13, color: newDate ? 'var(--blk2)' : 'var(--lgrey)', fontWeight: newDate ? 600 : 400 }}>
+                      {newDate ? fmtDate(newDate) : '—'}
+                    </div>
+                  </div>
+                </div>
               </div>
               {RoleCan.manageUsers(user?.role) && restrictedUsers.length > 0 && (
                 <div style={{ marginBottom: 16 }}>
@@ -14727,8 +14737,10 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
                   style={{ background: 'transparent', color: '#444', border: '1px solid var(--bdr)', padding: '8px 14px', borderRadius: 5, fontSize: 13, cursor: 'pointer' }}>
                   Annuleren
                 </button>
-                <button type="submit"
-                  style={{ background: '#E11D48', color: '#fff', border: 'none', padding: '8px 18px', borderRadius: 5, fontSize: 13, fontWeight: 600, cursor: 'pointer' }}>
+                <button type="submit" disabled={!newEdition}
+                  title={!newEdition ? 'Kies eerst een wedstrijd uit de kalender' : ''}
+                  style={{ background: '#E11D48', color: '#fff', border: 'none', padding: '8px 18px', borderRadius: 5, fontSize: 13, fontWeight: 600,
+                           cursor: newEdition ? 'pointer' : 'not-allowed', opacity: newEdition ? 1 : 0.45 }}>
                   Aanmaken
                 </button>
               </div>
@@ -14778,7 +14790,7 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
 //   onPick   — (editionRow | null) => void
 //   compact  — minder marge, voor gebruik in een bestaande modal
 // =================================================================
-function EditionPicker({ value, onPick, compact = false }) {
+function EditionPicker({ value, onPick, compact = false, required = false }) {
   const [seasons, setSeasons] = useState([]);
   const [disciplines, setDisciplines] = useState([]);
   const [editions, setEditions] = useState([]);
@@ -14894,7 +14906,7 @@ function EditionPicker({ value, onPick, compact = false }) {
             onPick(row);
           }}
           style={sel}>
-          <option value="">— geen wedstrijd, vrije invoer —</option>
+          <option value="">{required ? '— kies een wedstrijd —' : '— geen wedstrijd, vrije invoer —'}</option>
           {visible.map(e => (
             <option key={e.edition_id} value={e.edition_id}>
               {e.event_name}
@@ -14906,6 +14918,7 @@ function EditionPicker({ value, onPick, compact = false }) {
         {!loadingEditions && visible.length === 0 && (
           <div style={{ fontSize: 10.5, color: 'var(--grey)', marginTop: 4 }}>
             Geen wedstrijden in dit seizoen{discipline ? ' voor deze discipline' : ''}.
+            {required && <> Voeg er eerst een toe onder <strong>Wedstrijden</strong>.</>}
           </div>
         )}
         {selected && (
