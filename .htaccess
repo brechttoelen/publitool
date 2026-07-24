@@ -1,0 +1,57 @@
+# =============================================================================
+# Publi Tool — Apache configuratie voor snellere laad-tijden op one.com
+# =============================================================================
+# Upload dit bestand naar httpdocs/parcours/.htaccess
+# (Let op: bestand begint met een punt — soms verbergt Finder die. Gebruik
+# Cmd+Shift+. om verborgen bestanden te tonen.)
+# =============================================================================
+
+# --- Compressie ----------------------------------------------------------------
+# Comprimeert HTML/CSS/JS/JSON met gzip vóór ze naar de browser gestuurd worden.
+# Voor Publi Tool is dit ~5× kleinere transfer (van ~550KB naar ~120KB).
+<IfModule mod_deflate.c>
+  AddOutputFilterByType DEFLATE text/html
+  AddOutputFilterByType DEFLATE text/css
+  AddOutputFilterByType DEFLATE text/javascript
+  AddOutputFilterByType DEFLATE application/javascript
+  AddOutputFilterByType DEFLATE application/json
+  AddOutputFilterByType DEFLATE image/svg+xml
+</IfModule>
+
+# --- Cache-headers -------------------------------------------------------------
+# Browsers slaan bestanden lokaal op en vragen ze de volgende keer niet opnieuw.
+# Strategie:
+#   - index.html: ETag check (snel "is dit nog dezelfde?" zonder volledige download)
+#   - Afbeeldingen/uploads: 30 dagen (veranderen zelden)
+#   - PHP-API: nooit cachen (data is dynamisch)
+<IfModule mod_expires.c>
+  ExpiresActive On
+  
+  # HTML: korte cache + ETag-validatie. Browsers checken bij elk bezoek
+  # of de HTML veranderd is, maar een 'niet veranderd' antwoord is supersnel
+  # (~50ms vs 2s volledige download).
+  ExpiresByType text/html "access plus 0 seconds"
+  
+  # Afbeeldingen (uploads/, achtergrondkaarten): 30 dagen
+  ExpiresByType image/jpeg "access plus 30 days"
+  ExpiresByType image/png "access plus 30 days"
+  ExpiresByType image/webp "access plus 30 days"
+  ExpiresByType image/svg+xml "access plus 30 days"
+</IfModule>
+
+# ETag op basis van bestand-grootte + wijzigingsdatum (snel + betrouwbaar)
+FileETag MTime Size
+
+# --- Geen cache voor PHP API ---------------------------------------------------
+# /api/*.php geeft live data terug; nooit cachen anders zie je oude info.
+<FilesMatch "\.php$">
+  <IfModule mod_headers.c>
+    Header set Cache-Control "no-store, no-cache, must-revalidate"
+  </IfModule>
+</FilesMatch>
+
+# --- Veiligheid (klein bonusje) ------------------------------------------------
+<IfModule mod_headers.c>
+  # Voorkom dat browsers de file-type "raden" (verkleint kans op XSS)
+  Header set X-Content-Type-Options "nosniff"
+</IfModule>

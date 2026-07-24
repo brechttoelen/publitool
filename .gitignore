@@ -1,0 +1,6 @@
+config.php
+uploads/
+.DS_Store
+*.log
+node_modules/
+.vscode/
