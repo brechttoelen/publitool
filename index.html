@@ -891,6 +891,8 @@ const api = {
         slug: data.slug, name: data.name,
         discipline: data.discipline || 'veldrijden',
         sort_order: data.sort_order ?? 0,
+        short_name: data.short_name || null,
+        color: data.color || '#1c1917',
       }).select().single());
       return { series: row };
     },
@@ -927,6 +929,27 @@ const api = {
     deleteEvent: async (id) => {
       chk(await sb.from('flcs_events')
         .update({ deleted_at: new Date().toISOString() }).eq('id', id));
+      return { ok: true };
+    },
+
+    // ----- partners per reeks (lokaal, blijft in de Publitool-database) -----
+    seriesPartners: async () => {
+      const rows = chk(await sb.from('publitool_series_partners')
+        .select('series_slug, partner_id, sort_order, partner:publitool_partners(id, name, color, logo_path, is_local)')
+        .order('sort_order'));
+      const bySeries = {};
+      for (const l of (rows || [])) {
+        if (!bySeries[l.series_slug]) bySeries[l.series_slug] = [];
+        if (l.partner) bySeries[l.series_slug].push(l.partner);
+      }
+      return { bySeries };
+    },
+    setSeriesPartners: async (slug, partnerIds) => {
+      chk(await sb.from('publitool_series_partners').delete().eq('series_slug', slug));
+      if (Array.isArray(partnerIds) && partnerIds.length) {
+        chk(await sb.from('publitool_series_partners')
+          .insert(partnerIds.map((pid, i) => ({ series_slug: slug, partner_id: pid, sort_order: i }))));
+      }
       return { ok: true };
     },
 
@@ -14427,7 +14450,6 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
           { id: 'parcours', label: 'Events',           icon: '📅', show: true },
           { id: 'wedstrijden', label: 'Wedstrijden',   icon: '🏁', show: true },
           { id: 'partners', label: 'Partners',         icon: '🤝', show: RoleCan.managePartners(user?.role) },
-          { id: 'koepels',  label: 'Koepels',          icon: '🏆', show: RoleCan.manageKoepels(user?.role) },
           { id: 'profiles', label: 'Export-profielen', icon: '📄', show: RoleCan.manageProfiles(user?.role) },
           { id: 'users',    label: 'Gebruikers',       icon: '👤', show: RoleCan.manageUsers(user?.role) },
         ].filter(t => t.show);
@@ -14660,10 +14682,6 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
           <PartnersTab partners={partners} koepels={koepels} onReload={() => reloadAll(currentSeasonId)} />
         )}
         
-        {tab === 'koepels' && (
-          <KoepelsTab koepels={koepels} partners={partners} onReload={() => reloadAll(currentSeasonId)} />
-        )}
-        
         {tab === 'profiles' && (
           <ExportProfilesTab />
         )}
@@ -14811,6 +14829,10 @@ function Dashboard({ user, onLogout, onOpenParcours, currentTab, onTabChange }) 
 function EditionPicker({ value, onPick, compact = false, required = false }) {
   const [seasons, setSeasons] = useState([]);
   const [disciplines, setDisciplines] = useState([]);
+  // Partners per reeks (lokaal) + de volledige partnerlijst voor de picker
+  const [seriesPartners, setSeriesPartners] = useState({});
+  const [allPartners, setAllPartners] = useState([]);
+  const [partnersFor, setPartnersFor] = useState(null); // reeks waarvan partners bewerkt worden
   const [editions, setEditions] = useState([]);
   const [seasonId, setSeasonId] = useState('');
   const [discipline, setDiscipline] = useState('');
@@ -15882,13 +15904,16 @@ function WedstrijdenTab({ user }) {
   const canEdit = user?.role === 'admin' || user?.role === 'editor';
 
   const loadBase = async (keepSeasonId = null) => {
-    const [s, sr, ev, di] = await Promise.all([
+    const [s, sr, ev, di, sp, pa] = await Promise.all([
       api.cal.seasons(), api.cal.series(), api.cal.events(), api.cal.disciplines(),
+      api.cal.seriesPartners(), api.partners(),
     ]);
     setSeasons(s.seasons);
     setSeries(sr.series);
     setEvents(ev.events);
     setDisciplines(di.disciplines);
+    setSeriesPartners(sp.bySeries || {});
+    setAllPartners((pa.partners || []).filter(p => !p.is_local));
     let sid = keepSeasonId || seasonId;
     if (!sid || !s.seasons.some(x => x.id === sid)) {
       const cur = s.seasons.find(x => x.is_current);
@@ -16125,7 +16150,7 @@ function WedstrijdenTab({ user }) {
           {sub === 'reeksen' && (
             <>
               <div style={{ fontSize: 12, color: 'var(--grey)', marginBottom: 14 }}>
-                Eén naam per reeks. Wisselt de sponsornaam, dan pas je hem hier gewoon aan — oude edities volgen mee.
+                Eén naam per reeks. Partners die je hier koppelt verschijnen automatisch bij elk parcours van die reeks.
               </div>
               {series.length === 0 ? (
                 <div style={{ background: '#fff', border: '1px solid var(--bdr)', borderRadius: 6, padding: 30, textAlign: 'center', fontSize: 13, color: 'var(--grey)' }}>
@@ -16133,20 +16158,34 @@ function WedstrijdenTab({ user }) {
                 </div>
               ) : (
                 <div style={{ background: '#fff', border: '1px solid var(--bdr)', borderRadius: 6, overflow: 'hidden' }}>
-                  {series.map((s, i) => (
+                  {series.map((s, i) => {
+                    const parts = seriesPartners[s.slug] || [];
+                    return (
                     <div key={s.id} style={{
                       display: 'flex', alignItems: 'center', gap: 12, padding: '11px 14px',
                       borderBottom: i === series.length - 1 ? 'none' : '1px solid #f0f0ee',
                     }}>
+                      <span style={{ width: 22, height: 22, borderRadius: 5, background: s.color || '#1c1917', border: '1px solid var(--bdr)', flexShrink: 0 }} />
                       <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--blk2)' }}>{s.name}</div>
+                        <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--blk2)' }}>
+                          {s.name}
+                          {s.short_name && (
+                            <span style={{ marginLeft: 8, fontSize: 10, fontWeight: 700, color: 'var(--grey)', background: '#f4f4f2', padding: '2px 6px', borderRadius: 4 }}>
+                              {s.short_name}
+                            </span>
+                          )}
+                        </div>
                         <div style={{ fontSize: 10.5, color: 'var(--grey)', fontFamily: 'monospace', marginTop: 1 }}>{s.slug}</div>
                       </div>
                       <span style={{ fontSize: 11, color: 'var(--blk4)', background: '#f4f4f2', padding: '3px 8px', borderRadius: 12 }}>
                         {disciplineLabel(s.discipline, disciplines)}
                       </span>
+                      <span style={{ fontSize: 11, color: 'var(--grey)', minWidth: 66, textAlign: 'right' }}>
+                        {parts.length} partner{parts.length !== 1 ? 's' : ''}
+                      </span>
                       {canEdit && (
                         <div style={{ display: 'flex', gap: 6 }}>
+                          <button onClick={() => setPartnersFor(s)} style={calBtnStyle()}>Partners</button>
                           <button onClick={() => setSeriesModal({ mode: 'edit', series: s })}
                             style={calBtnStyle()}>Bewerken</button>
                           <button onClick={async () => {
@@ -16157,7 +16196,8 @@ function WedstrijdenTab({ user }) {
                         </div>
                       )}
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
             </>
@@ -16313,6 +16353,16 @@ function WedstrijdenTab({ user }) {
           disciplines={disciplines}
           onClose={() => setSeriesModal(null)}
           onDone={async () => { setSeriesModal(null); await reloadAll(seasonId); }}
+        />
+      )}
+
+      {partnersFor && (
+        <CalSeriesPartnersModal
+          series={partnersFor}
+          allPartners={allPartners}
+          selected={(seriesPartners[partnersFor.slug] || []).map(p => p.id)}
+          onClose={() => setPartnersFor(null)}
+          onDone={async () => { setPartnersFor(null); await reloadAll(seasonId); }}
         />
       )}
 
@@ -16831,6 +16881,8 @@ function CalSeriesModal({ mode, series, disciplines, onClose, onDone }) {
   const [discipline, setDiscipline] = useState(
     series?.discipline || (disciplines && disciplines[0] ? disciplines[0].slug : ''));
   const [sortOrder, setSortOrder]   = useState(series?.sort_order ?? 0);
+  const [shortName, setShortName]   = useState(series?.short_name || '');
+  const [color, setColor]           = useState(series?.color || '#1c1917');
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState(null);
 
@@ -16839,7 +16891,12 @@ function CalSeriesModal({ mode, series, disciplines, onClose, onDone }) {
     const finalSlug = slug.trim() || slugify(name);
     if (!discipline) { setErr('Maak eerst een discipline aan onder de tab Disciplines.'); return; }
     setSaving(true); setErr(null);
-    const payload = { name: name.trim(), slug: finalSlug, discipline, sort_order: Number(sortOrder) || 0 };
+    const payload = {
+      name: name.trim(), slug: finalSlug, discipline,
+      sort_order: Number(sortOrder) || 0,
+      short_name: shortName.trim() || null,
+      color,
+    };
     try {
       if (mode === 'new') await api.cal.createSeries(payload);
       else await api.cal.updateSeries(series.id, payload);
@@ -16876,7 +16933,7 @@ function CalSeriesModal({ mode, series, disciplines, onClose, onDone }) {
           style={{ ...calInput, fontFamily: 'monospace', fontSize: 12 }} />
       </div>
 
-      <div style={{ display: 'flex', gap: 10 }}>
+      <div style={{ display: 'flex', gap: 10, marginBottom: 12 }}>
         <div style={{ flex: 1 }}>
           <label style={calLabel}>Discipline</label>
           <select value={discipline} onChange={e => setDiscipline(e.target.value)} style={calInput}>
@@ -16887,6 +16944,96 @@ function CalSeriesModal({ mode, series, disciplines, onClose, onDone }) {
           <label style={calLabel}>Volgorde</label>
           <input type="number" value={sortOrder} onChange={e => setSortOrder(e.target.value)} style={calInput} />
         </div>
+      </div>
+
+      <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
+        <div style={{ flex: 1 }}>
+          <label style={calLabel}>Afkorting</label>
+          <input value={shortName} onChange={e => setShortName(e.target.value)}
+            placeholder="SP" maxLength={12} style={calInput} />
+        </div>
+        <div>
+          <label style={calLabel}>Kleur</label>
+          <label style={{ position: 'relative', display: 'block', width: 46, height: 34, cursor: 'pointer' }}>
+            <input type="color" value={color} onChange={e => setColor(e.target.value)}
+              style={{ position: 'absolute', inset: 0, opacity: 0, cursor: 'pointer' }} />
+            <div style={{ width: 46, height: 34, borderRadius: 5, background: color, border: '1px solid var(--bdr)' }} />
+          </label>
+        </div>
+      </div>
+      <div style={{ fontSize: 10.5, color: 'var(--grey)', marginTop: 6 }}>
+        Afkorting en kleur horen bij de reeks zelf en reizen mee naar andere apps.
+      </div>
+    </CalModalShell>
+  );
+}
+
+// =================================================================
+// CalSeriesPartnersModal — standaard-partners van een reeks
+// -----------------------------------------------------------------
+// Vervangt de koepel-partners: wie hier aangevinkt staat, verschijnt
+// automatisch bij elk parcours van deze reeks.
+// =================================================================
+function CalSeriesPartnersModal({ series, allPartners, selected, onClose, onDone }) {
+  const [ids, setIds] = useState(new Set(selected || []));
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState(null);
+  const [q, setQ] = useState('');
+
+  const toggle = (pid) => {
+    const next = new Set(ids);
+    if (next.has(pid)) next.delete(pid); else next.add(pid);
+    setIds(next);
+  };
+
+  const save = async () => {
+    setSaving(true); setErr(null);
+    try {
+      await api.cal.setSeriesPartners(series.slug, Array.from(ids));
+      onDone();
+    } catch (e) { setErr(e.message); setSaving(false); }
+  };
+
+  const filtered = (allPartners || []).filter(p =>
+    !q.trim() || p.name.toLowerCase().includes(q.trim().toLowerCase()));
+
+  return (
+    <CalModalShell
+      title={`Partners — ${series.name}`}
+      subtitle="Deze partners verschijnen automatisch bij elk parcours van deze reeks."
+      onClose={onClose} onSave={save} saving={saving} width={480}>
+
+      {err && (
+        <div style={{ background: '#fee2e2', color: '#b91c1c', padding: '8px 10px', borderRadius: 5, fontSize: 11.5, marginBottom: 12 }}>
+          {err}
+        </div>
+      )}
+
+      <input value={q} onChange={e => setQ(e.target.value)} placeholder="Zoek een partner..."
+        style={{ ...calInput, marginBottom: 10 }} />
+
+      {filtered.length === 0 ? (
+        <div style={{ fontSize: 12.5, color: 'var(--grey)', padding: '14px 0' }}>
+          {allPartners.length === 0 ? 'Nog geen koepel-partners aangemaakt.' : 'Geen partner gevonden.'}
+        </div>
+      ) : (
+        <div style={{ border: '1px solid var(--bdr)', borderRadius: 6, maxHeight: 320, overflowY: 'auto' }}>
+          {filtered.map((p, i) => (
+            <label key={p.id} style={{
+              display: 'flex', alignItems: 'center', gap: 10, padding: '8px 11px', cursor: 'pointer',
+              borderBottom: i === filtered.length - 1 ? 'none' : '1px solid #f4f4f2',
+              background: ids.has(p.id) ? '#fdf3f5' : 'transparent',
+            }}>
+              <input type="checkbox" checked={ids.has(p.id)} onChange={() => toggle(p.id)} />
+              <span style={{ width: 12, height: 12, borderRadius: 3, background: p.color || '#ccc', flexShrink: 0 }} />
+              <span style={{ fontSize: 12.5, color: 'var(--blk2)' }}>{p.name}</span>
+            </label>
+          ))}
+        </div>
+      )}
+
+      <div style={{ fontSize: 11, color: 'var(--grey)', marginTop: 10 }}>
+        {ids.size} van {allPartners.length} geselecteerd
       </div>
     </CalModalShell>
   );
@@ -18199,7 +18346,7 @@ function App() {
   
   // ============ ROUTING ============
   // URL-formaat: hash-based zodat we geen server-config nodig hebben.
-  //  - Dashboard:        #dashboard/{tab}    (tabs: events|wedstrijden|partners|koepels|profiles|users)
+  //  - Dashboard:        #dashboard/{tab}    (tabs: events|wedstrijden|partners|profiles|users)
   //  - Editor:           #parcours/{id}
   //  - Geen hash:        Dashboard + default tab (events)
   //
@@ -18216,7 +18363,7 @@ function App() {
       const hash = window.location.hash;
       const mEditor = hash.match(/^#parcours\/(.+)$/);
       if (mEditor) return { view: 'editor', parcoursId: mEditor[1], dashboardTab: 'parcours' };
-      const mDash = hash.match(/^#dashboard\/(events|wedstrijden|partners|koepels|profiles|users)$/);
+      const mDash = hash.match(/^#dashboard\/(events|wedstrijden|partners|profiles|users)$/);
       if (mDash) {
         // 'events' in URL = 'parcours' in interne state (legacy naming)
         const tab = mDash[1] === 'events' ? 'parcours' : mDash[1];
@@ -18292,7 +18439,7 @@ function App() {
           setView('editor');
           return;
         }
-        const mDash = hash.match(/^#dashboard\/(events|wedstrijden|partners|koepels|profiles|users)$/);
+        const mDash = hash.match(/^#dashboard\/(events|wedstrijden|partners|profiles|users)$/);
         if (mDash) {
           const tab = mDash[1] === 'events' ? 'parcours' : mDash[1];
           setView('dashboard');
